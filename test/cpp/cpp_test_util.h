@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <functional>
+#include <string>
 
 #include <ATen/ATen.h>
 #include <gtest/gtest.h>
@@ -36,6 +37,8 @@ static inline void AllClose(at::Tensor tensor, XLATensor& xla_tensor,
 }
 
 void ForEachDevice(const std::function<void(const Device&)>& devfn);
+
+std::string GetTensorTextGraph(at::Tensor tensor);
 
 }  // namespace cpp_test
 }  // namespace torch_xla
