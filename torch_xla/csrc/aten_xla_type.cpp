@@ -403,6 +403,9 @@ at::Tensor AtenXlaType::pow(const at::Tensor& self, at::Scalar exponent) const {
 
 at::Tensor AtenXlaType::add(const at::Tensor& self, const at::Tensor& other,
                             at::Scalar alpha) const {
+  if (other.dim() == 0) {
+    return add(self, other.item(), alpha);
+  }
   XLATensor self_tensor = bridge::GetXlaTensor(self);
   return bridge::AtenFromXlaTensor(XLATensor::add(
       self_tensor, bridge::GetOrCreateXlaTensor(other, self_tensor.GetDevice()),
@@ -411,6 +414,9 @@ at::Tensor AtenXlaType::add(const at::Tensor& self, const at::Tensor& other,
 
 at::Tensor& AtenXlaType::add_(at::Tensor& self, const at::Tensor& other,
                               at::Scalar alpha) const {
+  if (other.dim() == 0) {
+    return add_(self, other.item(), alpha);
+  }
   XLATensor self_tensor = bridge::GetXlaTensor(self);
   XLATensor::add_(self_tensor,
                   bridge::GetOrCreateXlaTensor(other, self_tensor.GetDevice()),
@@ -433,6 +439,9 @@ at::Tensor& AtenXlaType::add_(at::Tensor& self, at::Scalar other,
 
 at::Tensor AtenXlaType::sub(const at::Tensor& self, const at::Tensor& other,
                             at::Scalar alpha) const {
+  if (other.dim() == 0) {
+    return sub(self, other.item(), alpha);
+  }
   XLATensor self_tensor = bridge::GetXlaTensor(self);
   return bridge::AtenFromXlaTensor(XLATensor::sub(
       self_tensor, bridge::GetOrCreateXlaTensor(other, self_tensor.GetDevice()),
@@ -441,6 +450,9 @@ at::Tensor AtenXlaType::sub(const at::Tensor& self, const at::Tensor& other,
 
 at::Tensor& AtenXlaType::sub_(at::Tensor& self, const at::Tensor& other,
                               at::Scalar alpha) const {
+  if (other.dim() == 0) {
+    return sub_(self, other.item(), alpha);
+  }
   XLATensor self_tensor = bridge::GetXlaTensor(self);
   XLATensor::sub_(self_tensor,
                   bridge::GetOrCreateXlaTensor(other, self_tensor.GetDevice()),
@@ -463,6 +475,9 @@ at::Tensor& AtenXlaType::sub_(at::Tensor& self, at::Scalar other,
 
 at::Tensor AtenXlaType::rsub(const at::Tensor& self, const at::Tensor& other,
                              at::Scalar alpha) const {
+  if (other.dim() == 0) {
+    return rsub(self, other.item(), alpha);
+  }
   return bridge::AtenFromXlaTensor(XLATensor::rsub(
       bridge::GetXlaTensor(self), bridge::GetXlaTensor(other), alpha));
 }
@@ -475,6 +490,9 @@ at::Tensor AtenXlaType::rsub(const at::Tensor& self, at::Scalar other,
 
 at::Tensor AtenXlaType::mul(const at::Tensor& self,
                             const at::Tensor& other) const {
+  if (other.dim() == 0) {
+    return mul(self, other.item());
+  }
   XLATensor self_tensor = bridge::GetXlaTensor(self);
   return bridge::AtenFromXlaTensor(XLATensor::mul(
       self_tensor,
@@ -482,6 +500,9 @@ at::Tensor AtenXlaType::mul(const at::Tensor& self,
 }
 
 at::Tensor& AtenXlaType::mul_(at::Tensor& self, const at::Tensor& other) const {
+  if (other.dim() == 0) {
+    return mul_(self, other.item());
+  }
   XLATensor self_tensor = bridge::GetXlaTensor(self);
   XLATensor::mul_(self_tensor,
                   bridge::GetOrCreateXlaTensor(other, self_tensor.GetDevice()));
@@ -501,6 +522,9 @@ at::Tensor& AtenXlaType::mul_(at::Tensor& self, at::Scalar other) const {
 
 at::Tensor AtenXlaType::div(const at::Tensor& self,
                             const at::Tensor& other) const {
+  if (other.dim() == 0) {
+    return div(self, other.item());
+  }
   XLATensor self_tensor = bridge::GetXlaTensor(self);
   return bridge::AtenFromXlaTensor(XLATensor::div(
       self_tensor,
@@ -508,6 +532,9 @@ at::Tensor AtenXlaType::div(const at::Tensor& self,
 }
 
 at::Tensor& AtenXlaType::div_(at::Tensor& self, const at::Tensor& other) const {
+  if (other.dim() == 0) {
+    return div_(self, other.item());
+  }
   XLATensor self_tensor = bridge::GetXlaTensor(self);
   XLATensor::div_(self_tensor,
                   bridge::GetOrCreateXlaTensor(other, self_tensor.GetDevice()));
