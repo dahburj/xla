@@ -1,4 +1,5 @@
 #include "torch_xla/csrc/ops/permute.h"
+
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "torch_xla/csrc/lowering_context.h"
@@ -22,11 +23,16 @@ xla::Shape NodeOutputShape(const Value& input,
 
 }  // namespace
 
-Permute::Permute(const Value& input,
-                 tensorflow::gtl::ArraySlice<const xla::int64> dims)
-    : Node(ir::OpKind(at::aten::permute), {input}, NodeOutputShape(input, dims),
-           /*num_outputs=*/1, xla::util::MHash(dims)),
-      dims_(dims.begin(), dims.end()) {}
+Permute::Permute(const Value& input, std::vector<xla::int64> dims)
+    : Node(
+          ir::OpKind(at::aten::permute), {input},
+          [&]() { return NodeOutputShape(input, dims); },
+          /*num_outputs=*/1, xla::util::MHash(dims)),
+      dims_(std::move(dims)) {}
+
+NodePtr Permute::Clone(OpList operands) const {
+  return MakeNode<Permute>(operands.at(0), dims_);
+}
 
 XlaOpVector Permute::Lower(LoweringContext* loctx) const {
   xla::XlaOp input = loctx->GetOutputOp(operand(0));

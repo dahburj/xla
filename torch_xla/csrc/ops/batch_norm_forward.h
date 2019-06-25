@@ -9,8 +9,9 @@ namespace ops {
 class BatchNormForward : public Node {
  public:
   BatchNormForward(const Value& input, const Value& weight, const Value& bias,
-                   const Value& running_mean, const Value& running_var,
                    double momentum, double eps);
+
+  NodePtr Clone(OpList operands) const override;
 
   XlaOpVector Lower(LoweringContext* loctx) const override;
 

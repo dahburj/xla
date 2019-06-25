@@ -2,40 +2,63 @@
 
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
-#include "torch_xla/csrc/helpers.h"
 #include "torch_xla/csrc/lowering_context.h"
+#include "torch_xla/csrc/ops/xla_ops.h"
 
 namespace torch_xla {
 namespace ir {
 namespace ops {
 namespace {
 
-xla::Shape GetSelectShape(const xla::Shape& input_shape, xla::int64 dim,
-                          xla::int64 index) {
-  auto new_dims = XlaHelpers::DropDimensions(input_shape.dimensions(), {dim});
-  return xla::ShapeUtil::MakeShape(input_shape.element_type(), new_dims);
+xla::int64 GetStride(xla::int64 start, xla::int64 end, xla::int64 stride) {
+  if (stride == 0) {
+    XLA_CHECK_EQ(start, end);
+    stride = 1;
+  }
+  return stride;
 }
 
 }  // namespace
 
-Select::Select(const Value& input, xla::int64 dim, xla::int64 index)
-    : Node(ir::OpKind(at::aten::select), {input},
-           GetSelectShape(input.shape(), dim, index),
-           /*num_outputs=*/1, xla::util::MHash(dim, index)),
+Select::Select(const Value& input, xla::int64 dim, xla::int64 start,
+               xla::int64 end, xla::int64 stride)
+    : Node(
+          xla_select, {input},
+          [&]() {
+            return MakeSelectShape(input.shape(), dim, start, end, stride);
+          },
+          /*num_outputs=*/1, xla::util::MHash(dim, start, end, stride)),
       dim_(dim),
-      index_(index) {}
+      start_(start),
+      end_(end),
+      stride_(stride) {}
+
+NodePtr Select::Clone(OpList operands) const {
+  return MakeNode<Select>(operands.at(0), dim_, start_, end_, stride_);
+}
 
 XlaOpVector Select::Lower(LoweringContext* loctx) const {
   xla::XlaOp input = loctx->GetOutputOp(operand(0));
-  xla::XlaOp slice = xla::SliceInDim(input, index_, index_ + 1, 1, dim_);
-  xla::XlaOp output = xla::Reshape(slice, shape().dimensions());
+  xla::XlaOp output = xla::SliceInDim(input, start_, end_,
+                                      GetStride(start_, end_, stride_), dim_);
   return ReturnOp(output, loctx);
 }
 
 std::string Select::ToString() const {
   std::stringstream ss;
-  ss << Node::ToString() << ", dim=" << dim_ << ", index=" << index_;
+  ss << Node::ToString() << ", dim=" << dim_ << ", start=" << start_
+     << ", end=" << end_ << ", stride=" << stride_;
   return ss.str();
+}
+
+xla::Shape Select::MakeSelectShape(const xla::Shape& shape, xla::int64 dim,
+                                   xla::int64 start, xla::int64 end,
+                                   xla::int64 stride) {
+  xla::int64 effective_stride = GetStride(start, end, stride);
+  xla::Shape select_shape(shape);
+  select_shape.set_dimensions(
+      dim, (end - start + effective_stride - 1) / effective_stride);
+  return select_shape;
 }
 
 }  // namespace ops

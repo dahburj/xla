@@ -10,8 +10,9 @@ namespace ops {
 
 class AdaptiveAvgPool2d : public Node {
  public:
-  AdaptiveAvgPool2d(const Value& input,
-                    tensorflow::gtl::ArraySlice<const xla::int64> output_size);
+  AdaptiveAvgPool2d(const Value& input, std::vector<xla::int64> output_size);
+
+  NodePtr Clone(OpList operands) const override;
 
   XlaOpVector Lower(LoweringContext* loctx) const override;
 

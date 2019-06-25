@@ -4,25 +4,47 @@
 #include <functional>
 #include <list>
 #include <numeric>
+#include <thread>
 
 #include "tensorflow/compiler/xla/literal_util.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
+#include "tensorflow/compiler/xla/xla_client/multi_wait.h"
 #include "tensorflow/compiler/xla/xla_client/sys_util.h"
 #include "tensorflow/compiler/xla/xla_client/tf_logging.h"
+#include "tensorflow/compiler/xla/xla_client/thread_pool.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "tensorflow/core/lib/bfloat16/bfloat16.h"
 #include "torch_xla/csrc/helpers.h"
+#include "torch_xla/csrc/layout_manager.h"
 
 namespace torch_xla {
 namespace {
 
 bool ShouldUseBF16() {
-  int use_fp16 = xla::sys_util::GetEnvInt("XLA_USE_BF16", 0);
-  if (use_fp16 != 0) {
+  bool use_fp16 = xla::sys_util::GetEnvBool("XLA_USE_BF16", false);
+  if (use_fp16) {
     TF_LOG(INFO) << "Using BF16 data type for floating point values";
   }
-  return use_fp16 != 0;
+  return use_fp16;
+}
+
+bool ShouldUse32BitLong() {
+  bool use_32bit_long = xla::sys_util::GetEnvBool("XLA_USE_32BIT_LONG", false);
+  if (use_32bit_long) {
+    TF_LOG(INFO) << "Using 32bit integers for kLong values";
+  }
+  return use_32bit_long;
+}
+
+bool UseBF16() {
+  static bool use_fp16 = ShouldUseBF16();
+  return use_fp16;
+}
+
+bool Use32BitLong() {
+  static bool use_32bit_long = ShouldUse32BitLong();
+  return use_32bit_long;
 }
 
 xla::PrimitiveType XlaTypeFromTensorType(at::ScalarType scalar_type,
@@ -33,6 +55,8 @@ xla::PrimitiveType XlaTypeFromTensorType(at::ScalarType scalar_type,
                                                : xla::PrimitiveType::F32;
     case at::ScalarType::Float:
       return xla::PrimitiveType::F32;
+    case at::ScalarType::Bool:
+      return xla::PrimitiveType::PRED;
     case at::ScalarType::Byte:
       return xla::PrimitiveType::U8;
     case at::ScalarType::Char:
@@ -46,13 +70,6 @@ xla::PrimitiveType XlaTypeFromTensorType(at::ScalarType scalar_type,
     default:
       XLA_ERROR() << "Type not supported: " << scalar_type;
   }
-}
-
-// Creates a minor-to-major layout from given dimensions.
-xla::Shape MakeTorchTensorLayout(
-    tensorflow::gtl::ArraySlice<const xla::int64> dimensions,
-    xla::PrimitiveType type) {
-  return xla::ShapeUtil::MakeShapeWithDescendingLayout(type, dimensions);
 }
 
 // Copies n bytes from source to dest, with different stride values for source
@@ -137,6 +154,79 @@ std::vector<xla::int64> GetIterationDimensions(const xla::Shape& shape) {
   return iter_dims;
 }
 
+struct CopyPartition {
+  explicit CopyPartition(
+      tensorflow::gtl::ArraySlice<const xla::int64> dimensions)
+      : base(dimensions.size()), limit(dimensions.begin(), dimensions.end()) {}
+
+  std::vector<xla::int64> base;
+  std::vector<xla::int64> limit;
+};
+
+std::vector<CopyPartition> CreateCopyPartitions(
+    tensorflow::gtl::ArraySlice<const xla::int64> dimensions,
+    xla::int64 strided_copy_dimension) {
+  // The minimum number of elements copy that can be assigned to a thread.
+  static const xla::int64 kMinThreadElements = 100000;
+  // Use at most 50% of the available cores.
+  xla::int64 max_parts =
+      std::max<xla::int64>(std::thread::hardware_concurrency() / 2, 1);
+  // Find the maximum dimension which is not the strided copy dimension.
+  xla::int64 max_dim = -1;
+  for (xla::int64 i = 0; i < dimensions.size(); ++i) {
+    if (i != strided_copy_dimension &&
+        (max_dim < 0 || dimensions[i] > dimensions[max_dim])) {
+      max_dim = i;
+    }
+  }
+
+  xla::int64 num_elements = xla::util::Multiply<xla::int64>(dimensions);
+  xla::int64 max_dim_unit_elements = num_elements / dimensions[max_dim];
+  xla::int64 max_dim_size = dimensions[max_dim];
+  xla::int64 part_size =
+      std::max<xla::int64>(std::max<xla::int64>(max_dim_size / max_parts, 1),
+                           kMinThreadElements / max_dim_unit_elements);
+  std::vector<CopyPartition> parts;
+  xla::int64 csize = 0;
+  while (csize < max_dim_size) {
+    xla::int64 n = std::min<xla::int64>(part_size, max_dim_size - csize);
+    CopyPartition p(dimensions);
+    p.base[max_dim] = csize;
+    p.limit[max_dim] = csize + n;
+    csize += n;
+    parts.emplace_back(std::move(p));
+  }
+  return parts;
+}
+
+template <typename SType, typename DType>
+void SlicedCopy(tensorflow::gtl::ArraySlice<const xla::int64> dimensions,
+                const SType* src_data,
+                tensorflow::gtl::ArraySlice<const xla::int64> src_strides,
+                DType* dest_data,
+                tensorflow::gtl::ArraySlice<const xla::int64> dest_strides,
+                tensorflow::gtl::ArraySlice<const xla::int64> iter_dims,
+                const CopyPartition& part) {
+  std::vector<xla::int64> indices(part.base);
+  xla::int64 inner_src_stride = src_strides[iter_dims.front()];
+  xla::int64 inner_dest_stride = dest_strides[iter_dims.front()];
+  xla::int64 n = 0;
+  while (n < indices.size()) {
+    StridedCopy(dest_data + GetFlatTensorOffset(dest_strides, indices),
+                inner_dest_stride,
+                src_data + GetFlatTensorOffset(src_strides, indices),
+                inner_src_stride, dimensions[iter_dims.front()]);
+    for (n = 1; n < indices.size(); ++n) {
+      xla::int64 dim = iter_dims[n];
+      indices[dim] += 1;
+      if (indices[dim] < part.limit[dim]) {
+        break;
+      }
+      indices[dim] = part.base[dim];
+    }
+  }
+}
+
 template <typename SType, typename DType>
 void CopyTensors(const void* src_buffer, const xla::Shape& src_shape,
                  void* dest_buffer, size_t dest_buffer_size,
@@ -154,30 +244,24 @@ void CopyTensors(const void* src_buffer, const xla::Shape& src_shape,
     CopyData<DType, SType>(dest_data, src_data, total_elements,
                            typename CopyType < NeedCast<SType>::value ||
                                NeedCast<DType>::value > ::type());
-  } else {
+  } else if (total_elements > 0) {
+    // We issue a multi-threaded copy by slicing the bigger dimension and
+    // assigning its copy to different threads. This code is only valid for
+    // ranks >= 2, but the layout check above covers the case.
     std::vector<xla::int64> src_strides = ComputeShapeStrides(src_shape);
     std::vector<xla::int64> dest_strides = ComputeShapeStrides(dest_shape);
-    std::vector<xla::int64> indices(src_strides.size());
     std::vector<xla::int64> iter_dims = GetIterationDimensions(dest_shape);
-    xla::int64 inner_src_stride = src_strides[iter_dims.front()];
-    xla::int64 inner_dest_stride = dest_strides[iter_dims.front()];
-    xla::int64 n = 0;
-    while (n < iter_dims.size()) {
-      StridedCopy(dest_data + GetFlatTensorOffset(dest_strides, indices),
-                  inner_dest_stride,
-                  src_data + GetFlatTensorOffset(src_strides, indices),
-                  inner_src_stride, dest_shape.dimensions(iter_dims.front()));
-      // Compute the next index. Skip the lower iteration dimension, as we loop
-      // over it using the StridedCopy() call above.
-      for (n = 1; n < iter_dims.size(); ++n) {
-        xla::int64 dim = iter_dims[n];
-        indices[dim] += 1;
-        if (indices[dim] < dest_shape.dimensions(dim)) {
-          break;
-        }
-        indices[dim] = 0;
-      }
+    std::vector<CopyPartition> parts =
+        CreateCopyPartitions(dest_shape.dimensions(), iter_dims.front());
+    xla::util::MultiWait mwait(parts.size());
+    for (size_t i = 0; i < parts.size(); ++i) {
+      auto copy_fn = [&, i]() {
+        SlicedCopy<SType, DType>(dest_shape.dimensions(), src_data, src_strides,
+                                 dest_data, dest_strides, iter_dims, parts[i]);
+      };
+      xla::env::ScheduleClosure(mwait.Completer(std::move(copy_fn)));
     }
+    XLA_CHECK_OK(mwait.Wait());
   }
 }
 
@@ -209,6 +293,10 @@ void TensorToBufferSType(const at::Tensor& tensor, const xla::Shape& dest_shape,
     case xla::PrimitiveType::F64:
       TensorToBuffer<SType, double>(tensor, dest_shape, dest_buffer,
                                     dest_buffer_size, device);
+      break;
+    case xla::PrimitiveType::PRED:
+      TensorToBuffer<SType, bool>(tensor, dest_shape, dest_buffer,
+                                  dest_buffer_size, device);
       break;
     case xla::PrimitiveType::U8:
       TensorToBuffer<SType, xla::uint8>(tensor, dest_shape, dest_buffer,
@@ -247,6 +335,10 @@ void PopulateTensorBuffer(const at::Tensor& tensor,
       TensorToBufferSType<float>(tensor, dest_shape, dest_buffer,
                                  dest_buffer_size, device);
       break;
+    case at::ScalarType::Bool:
+      TensorToBufferSType<bool>(tensor, dest_shape, dest_buffer,
+                                dest_buffer_size, device);
+      break;
     case at::ScalarType::Byte:
       TensorToBufferSType<uint8_t>(tensor, dest_shape, dest_buffer,
                                    dest_buffer_size, device);
@@ -272,8 +364,9 @@ void PopulateTensorBuffer(const at::Tensor& tensor,
   }
 }
 
-std::shared_ptr<xla::ComputationClient::Data> TensorToXlaData(
-    const at::Tensor& tensor, const xla::Shape& shape, const Device& device) {
+xla::ComputationClient::DataPtr TensorToXlaData(const at::Tensor& tensor,
+                                                const xla::Shape& shape,
+                                                const Device& device) {
   auto populate_fn =
       [&](const xla::ComputationClient::TensorSource& source_tensor,
           void* dest_buffer, size_t dest_buffer_size) {
@@ -291,12 +384,12 @@ std::shared_ptr<xla::ComputationClient::Data> TensorToXlaData(
 }
 
 template <typename SType, typename DType>
-at::Tensor XlaLiteralToTensor(const xla::Literal& literal, at::ScalarType atype,
-                              xla::PrimitiveType xtype) {
+at::Tensor XlaLiteralToTensor(const xla::Literal& literal,
+                              at::ScalarType atype) {
   std::vector<int64_t> dimensions =
       xla::util::ToVector<int64_t>(literal.shape().dimensions());
-  xla::Shape torch_shape =
-      MakeTorchTensorLayout(literal.shape().dimensions(), xtype);
+  xla::Shape torch_shape = MakeTorchTensorLayout(
+      literal.shape().dimensions(), literal.shape().element_type());
   xla::int64 total_elements = xla::ShapeUtil::ElementsIn(torch_shape);
 
   const auto literal_data = literal.data<SType>();
@@ -309,52 +402,30 @@ at::Tensor XlaLiteralToTensor(const xla::Literal& literal, at::ScalarType atype,
 
 template <typename SType>
 at::Tensor XlaLiteralToTensorHelper(const xla::Literal& literal,
-                                    xla::PrimitiveType source_element_type,
                                     at::ScalarType dest_element_type) {
   switch (dest_element_type) {
-    case at::ScalarType::Byte: {
-      return XlaLiteralToTensor<SType, uint8_t>(literal, dest_element_type,
-                                                source_element_type);
-    }
-    case at::ScalarType::Char: {
-      return XlaLiteralToTensor<SType, int8_t>(literal, dest_element_type,
-                                               source_element_type);
-    }
-    case at::ScalarType::Short: {
-      return XlaLiteralToTensor<SType, int16_t>(literal, dest_element_type,
-                                                source_element_type);
-    }
-    case at::ScalarType::Int: {
-      return XlaLiteralToTensor<SType, int32_t>(literal, dest_element_type,
-                                                source_element_type);
-    }
-    case at::ScalarType::Long: {
-      return XlaLiteralToTensor<SType, int64_t>(literal, dest_element_type,
-                                                source_element_type);
-    }
-    case at::ScalarType::Float: {
-      return XlaLiteralToTensor<SType, float>(literal, dest_element_type,
-                                              source_element_type);
-    }
-    case at::ScalarType::Double: {
-      return XlaLiteralToTensor<SType, double>(literal, dest_element_type,
-                                               source_element_type);
-    }
+    case at::ScalarType::Bool:
+      return XlaLiteralToTensor<SType, bool>(literal, dest_element_type);
+    case at::ScalarType::Byte:
+      return XlaLiteralToTensor<SType, uint8_t>(literal, dest_element_type);
+    case at::ScalarType::Char:
+      return XlaLiteralToTensor<SType, int8_t>(literal, dest_element_type);
+    case at::ScalarType::Short:
+      return XlaLiteralToTensor<SType, int16_t>(literal, dest_element_type);
+    case at::ScalarType::Int:
+      return XlaLiteralToTensor<SType, int32_t>(literal, dest_element_type);
+    case at::ScalarType::Long:
+      return XlaLiteralToTensor<SType, int64_t>(literal, dest_element_type);
+    case at::ScalarType::Float:
+      return XlaLiteralToTensor<SType, float>(literal, dest_element_type);
+    case at::ScalarType::Double:
+      return XlaLiteralToTensor<SType, double>(literal, dest_element_type);
     default:
       XLA_ERROR() << "Unsupported scalar type: " << dest_element_type;
   }
 }
 
 }  // namespace
-
-namespace detail {
-
-bool UseBF16() {
-  static bool use_fp16 = ShouldUseBF16();
-  return use_fp16;
-}
-
-}  // namespace detail
 
 std::vector<xla::int64> ComputeShapeStrides(const xla::Shape& shape) {
   std::vector<xla::int64> strides(shape.rank());
@@ -368,65 +439,38 @@ std::vector<xla::int64> ComputeShapeStrides(const xla::Shape& shape) {
 
 at::Tensor MakeTensorFromXlaLiteral(const xla::Literal& literal,
                                     at::ScalarType dest_element_type) {
-  xla::PrimitiveType element_type = literal.shape().element_type();
-  switch (element_type) {
+  switch (literal.shape().element_type()) {
     case xla::PrimitiveType::PRED:
-      return XlaLiteralToTensorHelper<bool>(literal, element_type,
-                                            dest_element_type);
+      return XlaLiteralToTensorHelper<bool>(literal, dest_element_type);
     case xla::PrimitiveType::BF16:
-      return XlaLiteralToTensorHelper<tensorflow::bfloat16>(
-          literal, element_type, dest_element_type);
+      return XlaLiteralToTensorHelper<tensorflow::bfloat16>(literal,
+                                                            dest_element_type);
     case xla::PrimitiveType::F32:
-      return XlaLiteralToTensorHelper<float>(literal, element_type,
-                                             dest_element_type);
+      return XlaLiteralToTensorHelper<float>(literal, dest_element_type);
     case xla::PrimitiveType::F64:
-      return XlaLiteralToTensorHelper<double>(literal, element_type,
-                                              dest_element_type);
+      return XlaLiteralToTensorHelper<double>(literal, dest_element_type);
     case xla::PrimitiveType::U8:
-      return XlaLiteralToTensorHelper<xla::uint8>(literal, element_type,
-                                                  dest_element_type);
+      return XlaLiteralToTensorHelper<xla::uint8>(literal, dest_element_type);
     case xla::PrimitiveType::S8:
-      return XlaLiteralToTensorHelper<xla::int8>(literal, element_type,
-                                                 dest_element_type);
+      return XlaLiteralToTensorHelper<xla::int8>(literal, dest_element_type);
     case xla::PrimitiveType::S16:
-      return XlaLiteralToTensorHelper<xla::int16>(literal, element_type,
-                                                  dest_element_type);
+      return XlaLiteralToTensorHelper<xla::int16>(literal, dest_element_type);
     case xla::PrimitiveType::S32:
-      return XlaLiteralToTensorHelper<xla::int32>(literal, element_type,
-                                                  dest_element_type);
+      return XlaLiteralToTensorHelper<xla::int32>(literal, dest_element_type);
     case xla::PrimitiveType::S64:
-      return XlaLiteralToTensorHelper<xla::int64>(literal, element_type,
-                                                  dest_element_type);
+      return XlaLiteralToTensorHelper<xla::int64>(literal, dest_element_type);
     default:
       XLA_ERROR() << "Unsupported literal type: " << literal.shape();
   }
 }
 
-xla::Shape MakeArrayShapeFromDimensions(
-    tensorflow::gtl::ArraySlice<const xla::int64> dimensions,
-    xla::PrimitiveType type, DeviceType device_type) {
-  if (dimensions.size() == 4 && device_type == DeviceType::TPU) {
-    // Use a TPU-compatible layout for 4D tensors -- batch and feature in minor
-    // dimensions (HWCN).
-    return xla::ShapeUtil::MakeShapeWithLayout(type, dimensions, {0, 1, 3, 2});
-  }
-  return MakeTorchTensorLayout(dimensions, type);
-}
-
-xla::Shape MakeArrayShapeFromDimensions(const at::IntList& dimensions,
-                                        xla::PrimitiveType type,
-                                        DeviceType device_type) {
-  return MakeArrayShapeFromDimensions(XlaHelpers::I64List(dimensions), type,
-                                      device_type);
-}
-
-std::shared_ptr<xla::ComputationClient::Data> TensorToXlaData(
-    const at::Tensor& tensor, const Device& device) {
+xla::ComputationClient::DataPtr TensorToXlaData(const at::Tensor& tensor,
+                                                const Device& device) {
   return TensorToXlaData(
       tensor, CreateComputationShapeFromTensor(tensor, &device), device);
 }
 
-std::vector<std::shared_ptr<xla::ComputationClient::Data>> CreateTensorsData(
+std::vector<xla::ComputationClient::DataPtr> CreateTensorsData(
     const std::vector<at::Tensor>& tensors,
     const std::vector<std::string>& devices) {
   XLA_CHECK_EQ(tensors.size(), devices.size());
@@ -464,6 +508,31 @@ xla::Literal GetTensorLiteral(const at::Tensor& tensor, const xla::Shape* shape,
   return literal;
 }
 
+size_t TensorHash(const at::Tensor& tensor) {
+  at::Tensor ctensor = tensor.contiguous();
+  int64_t size = ctensor.numel() * ctensor.element_size();
+  switch (ctensor.scalar_type()) {
+    case at::ScalarType::Bool:
+      return xla::util::DataHash(ctensor.data<bool>(), size);
+    case at::ScalarType::Byte:
+      return xla::util::DataHash(ctensor.data<uint8_t>(), size);
+    case at::ScalarType::Char:
+      return xla::util::DataHash(ctensor.data<int8_t>(), size);
+    case at::ScalarType::Short:
+      return xla::util::DataHash(ctensor.data<int16_t>(), size);
+    case at::ScalarType::Int:
+      return xla::util::DataHash(ctensor.data<int32_t>(), size);
+    case at::ScalarType::Long:
+      return xla::util::DataHash(ctensor.data<int64_t>(), size);
+    case at::ScalarType::Float:
+      return xla::util::DataHash(ctensor.data<float>(), size);
+    case at::ScalarType::Double:
+      return xla::util::DataHash(ctensor.data<double>(), size);
+    default:
+      XLA_ERROR() << "Unsupported scalar type: " << ctensor.scalar_type();
+  }
+}
+
 std::vector<xla::Shape> GetComponentShapes(const xla::Shape& shape) {
   std::vector<xla::Shape> component_shapes;
   if (shape.IsTuple()) {
@@ -479,17 +548,15 @@ std::vector<xla::Shape> GetComponentShapes(const xla::Shape& shape) {
 
 xla::Shape MakeShapeWithDeviceLayout(const xla::Shape& shape,
                                      DeviceType device_type) {
-  std::vector<xla::Shape> shape_components = GetComponentShapes(shape);
-  std::vector<xla::Shape> shape_components_with_layout;
-  XLA_CHECK(!shape_components.empty());
-  for (const auto& shape_component : shape_components) {
-    shape_components_with_layout.push_back(MakeArrayShapeFromDimensions(
-        xla::util::ToVector<int64_t>(shape_component.dimensions()),
-        shape_component.element_type(), device_type));
-  }
-  return shape.IsTuple()
-             ? xla::ShapeUtil::MakeTupleShape(shape_components_with_layout)
-             : shape_components_with_layout.front();
+  xla::Shape device_shape(shape);
+  xla::ShapeUtil::ForEachMutableSubshape(
+      &device_shape, [&](xla::Shape* subshape, const xla::ShapeIndex&) {
+        if (subshape->IsArray()) {
+          *subshape = MakeArrayShapeFromDimensions(
+              subshape->dimensions(), subshape->element_type(), device_type);
+        }
+      });
+  return device_shape;
 }
 
 xla::Shape CreateComputationShapeFromTensor(const at::Tensor& tensor,
@@ -498,7 +565,8 @@ xla::Shape CreateComputationShapeFromTensor(const at::Tensor& tensor,
     device = GetDefaultDevice();
   }
   return MakeArrayShapeFromDimensions(
-      tensor.sizes(), MakeXlaPrimitiveType(tensor.type().scalarType(), device),
+      XlaHelpers::I64List(tensor.sizes()),
+      MakeXlaPrimitiveType(tensor.type().scalarType(), device),
       device->hw_type);
 }
 
@@ -509,6 +577,8 @@ at::ScalarType TensorTypeFromXlaType(xla::PrimitiveType xla_type) {
       return at::ScalarType::Float;
     case xla::PrimitiveType::F64:
       return at::ScalarType::Double;
+    case xla::PrimitiveType::PRED:
+      return at::ScalarType::Bool;
     case xla::PrimitiveType::U8:
       return at::ScalarType::Byte;
     case xla::PrimitiveType::S8:
@@ -524,36 +594,60 @@ at::ScalarType TensorTypeFromXlaType(xla::PrimitiveType xla_type) {
   }
 }
 
-xla::PrimitiveType MakeXlaPrimitiveType(at::ScalarType scalar_type,
-                                        const Device* device) {
+xla::PrimitiveType GetDevicePrimitiveType(xla::PrimitiveType type,
+                                          const Device* device) {
   if (device == nullptr) {
     device = GetDefaultDevice();
   }
-  switch (scalar_type) {
-    case at::ScalarType::Double:
-      if (detail::UseBF16()) {
+  switch (type) {
+    case xla::PrimitiveType::F64:
+      if (UseBF16()) {
         return xla::PrimitiveType::BF16;
       }
       return device->hw_type != DeviceType::TPU ? xla::PrimitiveType::F64
                                                 : xla::PrimitiveType::F32;
-    case at::ScalarType::Float:
+    case xla::PrimitiveType::F32:
       // When PyTorch will support native BF16 type, the global configuration
       // can be replaced (or augmented) with the proper mapping.
-      return detail::UseBF16() ? xla::PrimitiveType::BF16
-                               : xla::PrimitiveType::F32;
-    case at::ScalarType::Byte:
+      return UseBF16() ? xla::PrimitiveType::BF16 : xla::PrimitiveType::F32;
+    case xla::PrimitiveType::U8:
       return device->hw_type != DeviceType::TPU ? xla::PrimitiveType::U8
                                                 : xla::PrimitiveType::S32;
-    case at::ScalarType::Char:
+    case xla::PrimitiveType::S8:
       return device->hw_type != DeviceType::TPU ? xla::PrimitiveType::S8
                                                 : xla::PrimitiveType::S32;
-    case at::ScalarType::Short:
+    case xla::PrimitiveType::U16:
+      return device->hw_type != DeviceType::TPU ? xla::PrimitiveType::U16
+                                                : xla::PrimitiveType::S32;
+    case xla::PrimitiveType::S16:
       return device->hw_type != DeviceType::TPU ? xla::PrimitiveType::S16
                                                 : xla::PrimitiveType::S32;
+    case xla::PrimitiveType::S64:
+      return Use32BitLong() ? xla::PrimitiveType::S32 : xla::PrimitiveType::S64;
+    default:
+      return type;
+  }
+}
+
+xla::PrimitiveType MakeXlaPrimitiveType(at::ScalarType scalar_type,
+                                        const Device* device) {
+  switch (scalar_type) {
+    case at::ScalarType::Double:
+      return GetDevicePrimitiveType(xla::PrimitiveType::F64, device);
+    case at::ScalarType::Float:
+      return GetDevicePrimitiveType(xla::PrimitiveType::F32, device);
+    case at::ScalarType::Bool:
+      return GetDevicePrimitiveType(xla::PrimitiveType::PRED, device);
+    case at::ScalarType::Byte:
+      return GetDevicePrimitiveType(xla::PrimitiveType::U8, device);
+    case at::ScalarType::Char:
+      return GetDevicePrimitiveType(xla::PrimitiveType::S8, device);
+    case at::ScalarType::Short:
+      return GetDevicePrimitiveType(xla::PrimitiveType::S16, device);
     case at::ScalarType::Int:
-      return xla::PrimitiveType::S32;
+      return GetDevicePrimitiveType(xla::PrimitiveType::S32, device);
     case at::ScalarType::Long:
-      return xla::PrimitiveType::S64;
+      return GetDevicePrimitiveType(xla::PrimitiveType::S64, device);
     default:
       XLA_ERROR() << "Type not supported: " << scalar_type;
   }

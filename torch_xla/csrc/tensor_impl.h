@@ -14,22 +14,42 @@ namespace torch_xla {
 class XLATensorImpl : public c10::TensorImpl {
  public:
   explicit XLATensorImpl(XLATensor tensor);
-  XLATensorImpl(XLATensor tensor, bool is_variable);
 
   XLATensor& tensor() { return tensor_; }
 
-  c10::intrusive_ptr<c10::TensorImpl> shallow_copy_and_detach() const override;
+  c10::intrusive_ptr<TensorImpl> shallow_copy_and_detach(
+      const c10::VariableVersion& version_counter,
+      bool allow_tensor_metadata_change) const override;
 
-  bool is_contiguous() const override;
+  void shallow_copy_from(const c10::intrusive_ptr<TensorImpl>& impl) override;
+
+  at::IntArrayRef sizes() const override;
+
+  int64_t dim() const override;
+
+  int64_t numel() const override;
+
+  bool is_contiguous(at::MemoryFormat memory_format) const override;
+
+  int64_t size(int64_t d) const override;
+
+  static c10::Device GetCurrentAtenDevice();
+
+  static c10::Device SetCurrentAtenDevice(c10::Device device);
+
+  static void AtenInitialize();
+
+  const at::Storage& storage() const override;
+
+  bool has_storage() const override;
 
  private:
   void SetupSizeProperties();
 
   static caffe2::TypeMeta GetTypeMeta(const XLATensor& tensor);
 
-  static c10::Storage GetStorage(const XLATensor& tensor);
-
   XLATensor tensor_;
+  size_t generation_ = 0;
 };
 
 }  // namespace torch_xla

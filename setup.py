@@ -93,11 +93,12 @@ class Build(BuildExtension):
     # Run the original BuildExtension first. We need this before building
     # the tests.
     BuildExtension.run(self)
-    # Build the C++ tests
-    cmd = [os.path.join(base_dir, 'test/cpp/run_tests.sh'), '-B']
-    if subprocess.call(cmd) != 0:
-      print('Failed to build tests: {}'.format(cmd), file=sys.stderr)
-      sys.exit(1)
+    if _check_env_flag('BUILD_CPP_TESTS', default='1'):
+      # Build the C++ tests
+      cmd = [os.path.join(base_dir, 'test/cpp/run_tests.sh'), '-B']
+      if subprocess.call(cmd) != 0:
+        print('Failed to build tests: {}'.format(cmd), file=sys.stderr)
+        sys.exit(1)
 
 
 # Generate the code before globbing!
@@ -115,8 +116,7 @@ if subprocess.call(build_libs_cmd) != 0:
 
 # Fetch the sources to be built.
 torch_xla_sources = (
-    glob.glob('torch_xla/csrc/*.cpp') + glob.glob('torch_xla/csrc/ops/*.cpp') +
-    glob.glob('torch_xla/csrc/passes/*.cpp'))
+    glob.glob('torch_xla/csrc/*.cpp') + glob.glob('torch_xla/csrc/ops/*.cpp'))
 
 # Constant known variables used throughout this file
 lib_path = os.path.join(base_dir, 'torch_xla', 'lib')
@@ -162,6 +162,7 @@ def make_relative_rpath(path):
 
 
 extra_compile_args = [
+    '-std=c++14',
     '-Wno-sign-compare',
     '-Wno-deprecated-declarations',
     '-Wno-return-type',
@@ -182,13 +183,14 @@ if DEBUG:
 
 extra_link_args += ['-lxla_computation_client']
 
-version = '0.1'
-try:
-  sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
-                                cwd=base_dir).decode('ascii').strip()
-  version += '+' + sha[:7]
-except Exception:
-  pass
+version = os.getenv('TORCH_XLA_VERSION', '0.1')
+if _check_env_flag('VERSIONED_XLA_BUILD', default='0'):
+  try:
+    sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                                  cwd=base_dir).decode('ascii').strip()
+    version += '+' + sha[:7]
+  except Exception:
+    pass
 
 setup(
     name='torch_xla',

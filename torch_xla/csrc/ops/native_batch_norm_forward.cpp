@@ -1,4 +1,5 @@
 #include "torch_xla/csrc/ops/native_batch_norm_forward.h"
+
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "torch_xla/csrc/batch_norm.h"
@@ -30,15 +31,18 @@ xla::Shape NodeOutputShape(const Value& input, const Value& weight,
 NativeBatchNormForward::NativeBatchNormForward(const Value& input,
                                                const Value& weight,
                                                const Value& bias,
-                                               const Value& running_mean,
-                                               const Value& running_var,
                                                double momentum, double eps)
-    : Node(ir::OpKind(at::aten::native_batch_norm),
-           {input, weight, bias, running_mean, running_var},
-           NodeOutputShape(input, weight, bias),
-           /*num_outputs=*/3, xla::util::MHash(momentum, eps)),
+    : Node(
+          ir::OpKind(at::aten::native_batch_norm), {input, weight, bias},
+          [&]() { return NodeOutputShape(input, weight, bias); },
+          /*num_outputs=*/3, xla::util::MHash(momentum, eps)),
       momentum_(momentum),
       eps_(eps) {}
+
+NodePtr NativeBatchNormForward::Clone(OpList operands) const {
+  return MakeNode<NativeBatchNormForward>(operands.at(0), operands.at(1),
+                                          operands.at(2), momentum_, eps_);
+}
 
 XlaOpVector NativeBatchNormForward::Lower(LoweringContext* loctx) const {
   xla::XlaOp input = loctx->GetOutputOp(operand(0));

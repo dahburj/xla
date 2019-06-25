@@ -14,9 +14,11 @@ class MaskedFill : public Node {
 
   std::string ToString() const override;
 
+  NodePtr Clone(OpList operands) const override;
+
   XlaOpVector Lower(LoweringContext* loctx) const override;
 
-  const at::Scalar& value() const { return value_; }
+  at::Scalar value() const { return value_; }
 
  private:
   at::Scalar value_;

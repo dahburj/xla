@@ -1,4 +1,5 @@
 #include "torch_xla/csrc/ops/squeeze.h"
+
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "torch_xla/csrc/data_ops.h"
@@ -31,9 +32,15 @@ xla::Shape NodeOutputShape(const Value& input, int dim) {
 }  // namespace
 
 Squeeze::Squeeze(const Value& input, int dim)
-    : Node(ir::OpKind(at::aten::squeeze), {input}, NodeOutputShape(input, dim),
-           /*num_outputs=*/1, xla::util::MHash(dim)),
+    : Node(
+          ir::OpKind(at::aten::squeeze), {input},
+          [&]() { return NodeOutputShape(input, dim); },
+          /*num_outputs=*/1, xla::util::MHash(dim)),
       dim_(dim) {}
+
+NodePtr Squeeze::Clone(OpList operands) const {
+  return MakeNode<Squeeze>(operands.at(0), dim_);
+}
 
 XlaOpVector Squeeze::Lower(LoweringContext* loctx) const {
   xla::XlaOp input = loctx->GetOutputOp(operand(0));
@@ -43,7 +50,7 @@ XlaOpVector Squeeze::Lower(LoweringContext* loctx) const {
 
 std::string Squeeze::ToString() const {
   std::stringstream ss;
-  ss << Node::ToString() << " dim=" << dim_;
+  ss << Node::ToString() << ", dim=" << dim_;
   return ss.str();
 }
 

@@ -1,11 +1,11 @@
 #include "torch_xla/csrc/ops/constant_pad_nd.h"
-#include "torch_xla/csrc/ops/scalar.h"
 
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "torch_xla/csrc/helpers.h"
 #include "torch_xla/csrc/lowering_context.h"
 #include "torch_xla/csrc/ops/infer_output_shape.h"
+#include "torch_xla/csrc/ops/scalar.h"
 
 namespace torch_xla {
 namespace ir {
@@ -30,14 +30,18 @@ xla::Shape NodeOutputShape(const Value& input,
 
 }  // namespace
 
-ConstantPadNd::ConstantPadNd(const Value& input,
-                             tensorflow::gtl::ArraySlice<const xla::int64> pad,
-                             const at::Scalar& value)
-    : Node(ir::OpKind(at::aten::constant_pad_nd), OpList{input},
-           NodeOutputShape(input, pad),
-           /*num_outputs=*/1, xla::util::MHash(pad, ScalarHash(value))),
-      pad_(pad.begin(), pad.end()),
+ConstantPadNd::ConstantPadNd(const Value& input, std::vector<xla::int64> pad,
+                             at::Scalar value)
+    : Node(
+          ir::OpKind(at::aten::constant_pad_nd), OpList{input},
+          [&]() { return NodeOutputShape(input, pad); },
+          /*num_outputs=*/1, xla::util::MHash(pad, ScalarHash(value))),
+      pad_(std::move(pad)),
       value_(value) {}
+
+NodePtr ConstantPadNd::Clone(OpList operands) const {
+  return MakeNode<ConstantPadNd>(operands.at(0), pad_, value_);
+}
 
 XlaOpVector ConstantPadNd::Lower(LoweringContext* loctx) const {
   Output input = operand(0);

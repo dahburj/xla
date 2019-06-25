@@ -1,5 +1,6 @@
 #include "torch_xla/csrc/data_ops.h"
 
+#include <algorithm>
 #include <functional>
 #include <numeric>
 
@@ -11,53 +12,6 @@
 #include "torch_xla/csrc/helpers.h"
 
 namespace torch_xla {
-namespace {
-
-// Finds a at::prim::ListConstruct operation by id in the graph of "parent".
-std::vector<const torch::jit::Value*> InputListAttr(
-    const torch::jit::Node* parent, const size_t id) {
-  const auto nodes = parent->owningGraph()->block()->nodes();
-  std::vector<const torch::jit::Value*> result;
-  for (const auto node : nodes) {
-    if (node->kind() != at::prim::ListConstruct) {
-      continue;
-    }
-    const auto node_outputs = node->outputs();
-    XLA_CHECK_EQ(node_outputs.size(), size_t(1));
-    const auto output = node_outputs[0];
-    if (output->unique() != id) {
-      continue;
-    }
-    const auto node_inputs = node->inputs();
-    for (const auto input : node_inputs) {
-      result.push_back(input);
-    }
-    return result;
-  }
-  XLA_ERROR() << "Constant with id " << id << " not found";
-}
-
-std::vector<xla::XlaOp> BuildChunk(const xla::XlaOp& input, xla::int64 chunks,
-                                   xla::int64 dim) {
-  XLA_CHECK_GE(dim, 0) << "Negative dimension specified for chunk operator";
-  const auto input_sizes = XlaHelpers::SizesOfXlaOp(input);
-  XLA_CHECK_LT(dim, input_sizes.size())
-      << "Invalid dimension specified for chunk operator";
-  xla::int64 size_in_dim = input_sizes[dim];
-  xla::int64 split_size = xla::CeilOfRatio(size_in_dim, chunks);
-  std::vector<xla::int64> split_sizes(chunks, split_size);
-  split_sizes[chunks - 1] = split_size - (split_size * chunks - size_in_dim);
-  std::vector<xla::XlaOp> splits(chunks);
-  xla::int64 start_idx = 0;
-  for (xla::int64 i = 0; i < chunks; ++i) {
-    xla::int64 length = split_sizes[i];
-    splits[i] = xla::SliceInDim(input, start_idx, start_idx + length, 1, dim);
-    start_idx += length;
-  }
-  return splits;
-}
-
-}  // namespace
 
 std::vector<xla::int64> GetCompleteShape(
     tensorflow::gtl::ArraySlice<const xla::int64> output_sizes,
@@ -80,27 +34,17 @@ std::vector<xla::int64> GetCompleteShape(
     XLA_CHECK_EQ(total_element_count,
                  xla::util::Multiply<xla::int64>(output_sizes))
         << "[" << absl::StrJoin(output_sizes, ", ") << "] vs. ["
-        << "[" << absl::StrJoin(input_sizes, ", ") << "]";
+        << absl::StrJoin(input_sizes, ", ") << "]";
     return xla::util::ToVector<xla::int64>(output_sizes);
   }
   XLA_CHECK_EQ(total_element_count % incomplete_element_count, 0)
       << "[" << absl::StrJoin(output_sizes, ", ") << "] vs. ["
-      << "[" << absl::StrJoin(input_sizes, ", ") << "]";
+      << absl::StrJoin(input_sizes, ", ") << "]";
   std::vector<xla::int64> complete_output_sizes =
       xla::util::ToVector<xla::int64>(output_sizes);
   complete_output_sizes[*incomplete_dim] =
       total_element_count / incomplete_element_count;
   return complete_output_sizes;
-}
-
-xla::XlaOp BuildView(const torch::jit::Node* node, const xla::XlaOp& input) {
-  const auto node_inputs = node->inputs();
-  XLA_CHECK_EQ(node_inputs.size(), 2);
-  const auto node_outputs = node->outputs();
-  XLA_CHECK_EQ(node_outputs.size(), 1);
-  std::vector<int64_t> output_sizes =
-      node->get<std::vector<int64_t>>(at::attr::size).value();
-  return BuildView(input, XlaHelpers::I64List(output_sizes));
 }
 
 xla::XlaOp BuildView(
@@ -109,26 +53,6 @@ xla::XlaOp BuildView(
   const auto complete_output_sizes =
       GetCompleteShape(output_sizes, XlaHelpers::SizesOfXlaOp(input));
   return xla::Reshape(input, complete_output_sizes);
-}
-
-xla::XlaOp BuildReshape(
-    const torch::jit::Node* node, const xla::XlaOp& input,
-    const std::unordered_map<size_t, std::vector<xla::int64>>&
-        size_op_values_tracking) {
-  std::vector<xla::int64> output_sizes;
-  if (node->hasAttribute(at::attr::shape)) {
-    output_sizes = XlaHelpers::I64List(
-        node->get<std::vector<int64_t>>(at::attr::shape).value());
-  } else {
-    const auto size_op_value_it =
-        size_op_values_tracking.find(node->input(1)->unique());
-    XLA_CHECK(size_op_value_it != size_op_values_tracking.end())
-        << "at::aten::reshape only allowed when second parameter is a "
-           "constant size: "
-        << *node;
-    output_sizes = size_op_value_it->second;
-  }
-  return BuildView(input, output_sizes);
 }
 
 xla::XlaOp SqueezeTrivialDimension(const xla::XlaOp& input, size_t dim) {
@@ -151,16 +75,6 @@ xla::XlaOp SqueezeAllTrivialDimensions(const xla::XlaOp& input) {
   return xla::Reshape(input, non_singleton_dimensions);
 }
 
-xla::XlaOp BuildExpand(const torch::jit::Node* node, const xla::XlaOp& input) {
-  const auto node_inputs = node->inputs();
-  XLA_CHECK_GE(node_inputs.size(), 1);
-  const auto node_outputs = node->outputs();
-  XLA_CHECK_EQ(node_outputs.size(), 1);
-  const auto output_sizes =
-      node->get<std::vector<int64_t>>(at::attr::size).value();
-  return BuildExpand(input, XlaHelpers::I64List(output_sizes));
-}
-
 xla::XlaOp BuildExpand(
     const xla::XlaOp& input,
     tensorflow::gtl::ArraySlice<const xla::int64> output_sizes) {
@@ -174,11 +88,18 @@ xla::XlaOp BuildExpand(
                              xla::util::Iota<xla::int64>(output_sizes.size()));
 }
 
+std::vector<xla::int64> BuildUnsqueezeDimensions(
+    tensorflow::gtl::ArraySlice<const xla::int64> dimensions, size_t dim) {
+  XLA_CHECK_LE(dim, dimensions.size());
+  auto unsqueeze_dimensions = xla::util::ToVector<xla::int64>(dimensions);
+  unsqueeze_dimensions.insert(unsqueeze_dimensions.begin() + dim, 1);
+  return unsqueeze_dimensions;
+}
+
 xla::XlaOp BuildUnsqueeze(const xla::XlaOp& input, size_t dim) {
-  auto unsqueezed_sizes = XlaHelpers::SizesOfXlaOp(input);
-  XLA_CHECK_LE(dim, unsqueezed_sizes.size());
-  unsqueezed_sizes.insert(unsqueezed_sizes.begin() + dim, 1);
-  return xla::Reshape(input, unsqueezed_sizes);
+  auto dimensions =
+      BuildUnsqueezeDimensions(XlaHelpers::SizesOfXlaOp(input), dim);
+  return xla::Reshape(input, dimensions);
 }
 
 xla::XlaOp BuildStack(tensorflow::gtl::ArraySlice<const xla::XlaOp> inputs,
@@ -194,42 +115,10 @@ xla::XlaOp BuildStack(tensorflow::gtl::ArraySlice<const xla::XlaOp> inputs,
   return xla::ConcatInDim(inputs[0].builder(), reshaped_inputs, dim);
 }
 
-xla::XlaOp BuildStack(
-    const torch::jit::Node* node,
-    const std::function<xla::XlaOp(const torch::jit::Value*)>& node_op,
-    xla::XlaBuilder* b) {
-  const auto node_inputs = node->inputs();
-  XLA_CHECK_EQ(node_inputs.size(), size_t(2));
-  const auto stack_inputs = InputListAttr(node, node_inputs[0]->unique());
-  const auto dim = node->get<int64_t>(at::attr::dim).value();
-  std::vector<xla::XlaOp> inputs;
-  for (size_t i = 0; i < stack_inputs.size(); ++i) {
-    inputs.push_back(node_op(stack_inputs[i]));
-  }
-  return BuildStack(inputs, dim);
-}
-
 xla::XlaOp BuildCat(tensorflow::gtl::ArraySlice<const xla::XlaOp> inputs,
                     xla::int64 dim) {
   XLA_CHECK_GT(inputs.size(), 0);
   return xla::ConcatInDim(inputs[0].builder(), inputs, dim);
-}
-
-xla::XlaOp BuildCat(
-    const torch::jit::Node* node,
-    const std::function<xla::XlaOp(const torch::jit::Value*)>& node_op,
-    xla::XlaBuilder* b) {
-  const auto node_inputs = node->inputs();
-  XLA_CHECK_EQ(node_inputs.size(), size_t(2));
-  const auto stack_inputs = InputListAttr(node, node_inputs[0]->unique());
-  const auto dim = node->get<int64_t>(at::attr::dim).value();
-  std::vector<xla::XlaOp> cat_inputs;
-  // Reshape inputs along the dim axis.
-  for (size_t i = 0; i < stack_inputs.size(); ++i) {
-    const auto stack_input = stack_inputs[i];
-    cat_inputs.push_back(node_op(stack_input));
-  }
-  return BuildCat(cat_inputs, dim);
 }
 
 xla::XlaOp BuildRepeat(const xla::XlaOp& input,
@@ -251,13 +140,6 @@ xla::XlaOp BuildRepeat(const xla::XlaOp& input,
     repeated = xla::Broadcast(repeated, remaining_repeats);
   }
   return repeated;
-}
-
-std::vector<xla::XlaOp> BuildChunk(const torch::jit::Node* node,
-                                   const xla::XlaOp& input) {
-  int64_t chunks = node->get<int64_t>(at::attr::chunks).value();
-  int64_t dim = node->get<int64_t>(at::attr::dim).value();
-  return BuildChunk(input, chunks, dim);
 }
 
 size_t ComputeSplitCount(
@@ -289,6 +171,55 @@ std::vector<xla::XlaOp> BuildSplit(
     index += size;
   }
   return splits;
+}
+
+xla::XlaOp BuildUpdateSlice(
+    const xla::XlaOp& input, const xla::XlaOp& source,
+    tensorflow::gtl::ArraySlice<const xla::int64> base_indices) {
+  xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(input);
+  xla::XlaOp reshaped_source =
+      XlaHelpers::ReshapeToRank(source, input_shape.rank());
+  std::vector<xla::XlaOp> start_indices;
+  for (auto index : base_indices) {
+    start_indices.push_back(
+        XlaHelpers::ScalarValue<xla::int64>(index, input.builder()));
+  }
+  return xla::DynamicUpdateSlice(input, reshaped_source, start_indices);
+}
+
+xla::XlaOp BuildSlice(
+    const xla::XlaOp& input,
+    tensorflow::gtl::ArraySlice<const xla::int64> base_indices,
+    tensorflow::gtl::ArraySlice<const xla::int64> sizes) {
+  XLA_CHECK_EQ(base_indices.size(), sizes.size());
+  std::vector<xla::int64> limit_indices(base_indices.begin(),
+                                        base_indices.end());
+  std::transform(limit_indices.begin(), limit_indices.end(), sizes.begin(),
+                 limit_indices.begin(), std::plus<xla::int64>());
+  std::vector<xla::int64> strides(base_indices.size(), 1);
+  return xla::Slice(input, base_indices, limit_indices, strides);
+}
+
+xla::XlaOp BuildResize(const xla::XlaOp& input,
+                       tensorflow::gtl::ArraySlice<const xla::int64> size) {
+  xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(input);
+  xla::int64 num_elements = xla::ShapeUtil::ElementsIn(input_shape);
+  xla::XlaOp r1_input = xla::Reshape(input, {num_elements});
+  xla::int64 new_num_elements = xla::util::Multiply<xla::int64>(size);
+  xla::XlaOp resized_input = input;
+  if (num_elements > new_num_elements) {
+    resized_input = xla::SliceInDim(r1_input, 0, new_num_elements, 1, 0);
+  } else if (new_num_elements > num_elements) {
+    xla::XlaOp zero =
+        XlaHelpers::ScalarValue(0, input_shape.element_type(), input.builder());
+    xla::PaddingConfig padding_config;
+    auto* dims = padding_config.add_dimensions();
+    dims->set_edge_padding_low(0);
+    dims->set_interior_padding(0);
+    dims->set_edge_padding_high(new_num_elements - num_elements);
+    resized_input = xla::Pad(r1_input, zero, padding_config);
+  }
+  return xla::Reshape(resized_input, size);
 }
 
 }  // namespace torch_xla

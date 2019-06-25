@@ -9,7 +9,7 @@
 #include "tensorflow/compiler/xla/types.h"
 
 namespace xla {
-namespace xla_util {
+namespace util {
 
 // Support waiting for a number of tasks to complete.
 class MultiWait {
@@ -23,6 +23,9 @@ class MultiWait {
   // Waits until at least count (passed as constructor value) completions
   // happened.
   Status Wait();
+
+  // Same as above, but waits up to wait_seconds.
+  Status Wait(double wait_seconds);
 
   // Resets the threshold counter for the MultiWait object. The completed count
   // is also reset to zero.
@@ -41,7 +44,7 @@ class MultiWait {
   Status status_;
 };
 
-}  // namespace xla_util
+}  // namespace util
 }  // namespace xla
 
 #endif  // TENSORFLOW_COMPILER_XLA_XLA_CLIENT_MULTI_WAIT_H_

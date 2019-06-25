@@ -35,14 +35,30 @@ inline NodePtr DeviceDataOp(
 inline NodePtr GenericOp(OpKind op,
                          tensorflow::gtl::ArraySlice<const Value> operands,
                          xla::Shape shape, Generic::LowerFn lower_fn,
-                         size_t num_outputs = 1) {
+                         size_t num_outputs = 1,
+                         size_t hash_seed = 0x5a2d296e9) {
   return MakeNode<Generic>(std::move(op), operands, std::move(shape),
-                           std::move(lower_fn), num_outputs);
+                           std::move(lower_fn), num_outputs, hash_seed);
 }
 
-inline NodePtr CrossReplicaSumOp(const Value& operand,
+inline NodePtr GenericOp(OpKind op,
+                         tensorflow::gtl::ArraySlice<const Value> operands,
+                         const std::function<xla::Shape()>& shape_fn,
+                         Generic::LowerFn lower_fn, size_t num_outputs = 1,
+                         size_t hash_seed = 0x5a2d296e9) {
+  return MakeNode<Generic>(std::move(op), operands, shape_fn,
+                           std::move(lower_fn), num_outputs, hash_seed);
+}
+
+inline NodePtr GenericOp(OpKind op, xla::Shape shape, Generic::LowerFn lower_fn,
+                         size_t num_outputs, size_t hash_seed) {
+  return MakeNode<Generic>(std::move(op), std::move(shape), std::move(lower_fn),
+                           num_outputs, hash_seed);
+}
+
+inline NodePtr CrossReplicaSumOp(const Value& operand, double scale,
                                  std::vector<std::vector<xla::int64>> groups) {
-  return MakeNode<CrossReplicaSum>(operand, std::move(groups));
+  return MakeNode<CrossReplicaSum>(operand, scale, std::move(groups));
 }
 
 NodePtr Acos(const Value& input);
@@ -72,8 +88,6 @@ NodePtr SignOp(const Value& input);
 NodePtr Abs(const Value& input);
 
 NodePtr ReluOp(const Value& input);
-
-NodePtr TransposeOp(const Value& input);
 
 NodePtr Min(const Value& input, const Value& other);
 
@@ -105,14 +119,32 @@ NodePtr Pow(const Value& input, const Value& exponent);
 
 NodePtr Fmod(const Value& dividend, const Value& divisor);
 
+NodePtr TransposeOp(const Value& input, xla::int64 dim0, xla::int64 dim1);
+
+std::tuple<NodePtr, NodePtr> LogSigmoid(const Value& input);
+
+NodePtr LogSigmoidBackward(const Value& grad_output, const Value& input,
+                           const Value& buffer);
+
 NodePtr Sigmoid(const Value& input);
 
-NodePtr Clamp(const Value& input, c10::optional<at::Scalar> min,
-              c10::optional<at::Scalar> max);
+NodePtr SigmoidBackward(const Value& grad_output, const Value& output);
+
+NodePtr LogSoftmaxBackwardOp(const Value& grad_output, const Value& output,
+                             xla::int64 dim);
+
+NodePtr SoftmaxBackwardOp(const Value& grad_output, const Value& output,
+                          xla::int64 dim);
+
+NodePtr Clamp(const Value& input, const Value& min, const Value& max);
 
 NodePtr Ceil(const Value& input);
 
 NodePtr Floor(const Value& input);
+
+NodePtr Trunc(const Value& input);
+
+NodePtr FracOp(const Value& input);
 
 NodePtr AddMatMulOp(const Value& input, const Value& weight, const Value& bias);
 
@@ -128,15 +160,43 @@ NodePtr AdaptiveAvgPool2dBackward(const Value& grad_output, const Value& input);
 
 NodePtr ComparisonOp(c10::Symbol kind, const Value& input, const Value& other);
 
-NodePtr ComparisonOp(c10::Symbol kind, const Value& input,
-                     const at::Scalar& other);
+NodePtr ComparisonOp(c10::Symbol kind, const Value& input, at::Scalar other);
 
 NodePtr Where(const Value& condition, const Value& input, const Value& other);
 
-NodePtr ARange(const at::Scalar& start, const at::Scalar& end,
-               const at::Scalar& step, at::ScalarType scalar_type);
+NodePtr ARange(at::Scalar start, at::Scalar end, at::Scalar step,
+               at::ScalarType scalar_type);
 
 NodePtr BroadcastTensors(tensorflow::gtl::ArraySlice<const Value> tensors);
+
+NodePtr Norm(const Value& input, c10::optional<at::Scalar> p,
+             c10::optional<at::ScalarType> dtype,
+             tensorflow::gtl::ArraySlice<const xla::int64> dims, bool keepdim);
+
+NodePtr Identity(xla::int64 lines, xla::int64 cols,
+                 xla::PrimitiveType element_type);
+
+NodePtr Elu(const Value& input, at::Scalar alpha, at::Scalar scale,
+            at::Scalar input_scale);
+
+NodePtr EluBackward(const Value& grad_output, const Value& output,
+                    at::Scalar alpha, at::Scalar scale, at::Scalar input_scale);
+
+NodePtr Lshift(const Value& input, at::Scalar other);
+
+NodePtr Lshift(const Value& input, const Value& other);
+
+NodePtr Rshift(const Value& input, at::Scalar other);
+
+NodePtr Rshift(const Value& input, const Value& other);
+
+NodePtr Remainder(const Value& input, const Value& divisor);
+
+NodePtr MaxUnary(const Value& input);
+
+NodePtr MinUnary(const Value& input);
+
+NodePtr Bernoulli(const Value& input, const Value& probability);
 
 }  // namespace ops
 }  // namespace ir

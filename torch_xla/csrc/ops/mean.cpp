@@ -40,14 +40,23 @@ xla::Shape NodeOutputShape(const Value& input,
 
 Mean::Mean(const Value& input, std::vector<xla::int64> dimensions,
            bool keep_reduced_dimensions, c10::optional<at::ScalarType> dtype)
-    : Node(ir::OpKind(at::aten::mean), {input},
-           NodeOutputShape(input, dimensions, keep_reduced_dimensions, dtype),
-           /*num_outputs=*/1,
-           xla::util::MHash(dimensions, keep_reduced_dimensions,
-                            OptionalOr<int>(dtype, -1))),
+    : Node(
+          ir::OpKind(at::aten::mean), {input},
+          [&]() {
+            return NodeOutputShape(input, dimensions, keep_reduced_dimensions,
+                                   dtype);
+          },
+          /*num_outputs=*/1,
+          xla::util::MHash(dimensions, keep_reduced_dimensions,
+                           OptionalOr<int>(dtype, -1))),
       dimensions_(std::move(dimensions)),
       keep_reduced_dimensions_(keep_reduced_dimensions),
       dtype_(dtype) {}
+
+NodePtr Mean::Clone(OpList operands) const {
+  return MakeNode<Mean>(operands.at(0), dimensions_, keep_reduced_dimensions_,
+                        dtype_);
+}
 
 XlaOpVector Mean::Lower(LoweringContext* loctx) const {
   xla::XlaOp input = loctx->GetOutputOp(operand(0));

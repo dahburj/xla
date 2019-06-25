@@ -1,11 +1,12 @@
 #include "tensorflow/compiler/xla/xla_client/multi_wait.h"
 
+#include <chrono>
 #include <exception>
 
 #include "tensorflow/core/lib/core/errors.h"
 
 namespace xla {
-namespace xla_util {
+namespace util {
 
 void MultiWait::Done(Status status) {
   bool notify = false;
@@ -28,6 +29,15 @@ Status MultiWait::Wait() {
   return status_;
 }
 
+Status MultiWait::Wait(double wait_seconds) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!cv_.wait_for(lock, std::chrono::duration<double>(wait_seconds),
+                    [this] { return completed_count_ >= count_; })) {
+    return tensorflow::errors::DeadlineExceeded("Timeout");
+  }
+  return status_;
+}
+
 void MultiWait::Reset(size_t count) {
   std::lock_guard<std::mutex> lock(mutex_);
   count_ = count;
@@ -36,16 +46,16 @@ void MultiWait::Reset(size_t count) {
 }
 
 std::function<void()> MultiWait::Completer(std::function<void()> func) {
-  auto completer = [this, func{std::move(func)}]() {
+  auto completer = [this, func = std::move(func)]() {
     try {
       func();
       Done();
     } catch (const std::exception& ex) {
-      Done(tensorflow::errors::Aborted(ex.what()));
+      Done(tensorflow::errors::Internal(ex.what()));
     }
   };
   return completer;
 }
 
-}  // namespace xla_util
+}  // namespace util
 }  // namespace xla

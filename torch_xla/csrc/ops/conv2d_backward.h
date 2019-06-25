@@ -11,9 +11,10 @@ namespace ops {
 class Conv2dBackward : public Node {
  public:
   Conv2dBackward(const Value& grad_output, const Value& input,
-                 const Value& weight,
-                 tensorflow::gtl::ArraySlice<const xla::int64> stride,
-                 tensorflow::gtl::ArraySlice<const xla::int64> padding);
+                 const Value& weight, std::vector<xla::int64> stride,
+                 std::vector<xla::int64> padding);
+
+  NodePtr Clone(OpList operands) const override;
 
   XlaOpVector Lower(LoweringContext* loctx) const override;
 

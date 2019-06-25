@@ -7,7 +7,10 @@
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
+#include "torch_xla/csrc/convert_ops.h"
+#include "torch_xla/csrc/data_ops.h"
 #include "torch_xla/csrc/helpers.h"
+#include "torch_xla/csrc/tensor_util.h"
 
 namespace torch_xla {
 namespace {
@@ -71,6 +74,60 @@ std::pair<xla::XlaOp, xla::XlaOp> DotBroadcast(const xla::XlaOp& lhs,
   return std::make_pair(broadcasted_lhs, broadcasted_rhs);
 }
 
+// Builds the computation for the given combiner.
+xla::XlaComputation MakeScatterComputation(
+    const std::function<xla::XlaOp(xla::XlaOp, xla::XlaOp, xla::XlaBuilder*)>&
+        combiner,
+    xla::PrimitiveType element_type) {
+  xla::XlaBuilder cb("ScatterCombiner");
+  xla::Shape xla_scalar_shape = xla::ShapeUtil::MakeShape(element_type, {});
+  xla::XlaOp p0 = xla::Parameter(&cb, 0, xla_scalar_shape, "p0");
+  xla::XlaOp p1 = xla::Parameter(&cb, 1, xla_scalar_shape, "p1");
+  if (combiner) {
+    combiner(p0, p1, &cb);
+  }
+  return cb.Build().ConsumeValueOrDie();
+}
+
+xla::XlaOp CreateIndexAlongDim(
+    const xla::XlaOp& buffer, xla::int64 dim, const xla::XlaOp& index,
+    const xla::XlaOp& value, bool broadcast_value_to_index,
+    const std::function<xla::XlaOp(xla::XlaOp, xla::XlaOp, xla::XlaBuilder*)>&
+        combiner) {
+  xla::Shape buffer_shape = XlaHelpers::ShapeOfXlaOp(buffer);
+  xla::ScatterDimensionNumbers dim_numbers;
+  dim_numbers.set_index_vector_dim(1);
+  for (xla::int64 window_dim = 0; window_dim < buffer_shape.rank();
+       ++window_dim) {
+    if (window_dim != dim) {
+      dim_numbers.add_update_window_dims(window_dim);
+    } else {
+      dim_numbers.add_inserted_window_dims(window_dim);
+      dim_numbers.add_scatter_dims_to_operand_dims(window_dim);
+    }
+  }
+
+  // Broadcast the value to the right shape required by scatter.
+  xla::Shape value_shape = XlaHelpers::ShapeOfXlaOp(value);
+  xla::XlaOp updates = value;
+  if (buffer_shape.element_type() != value_shape.element_type()) {
+    updates = ConvertTo(updates, value_shape.element_type(),
+                        buffer_shape.element_type(), /*device=*/nullptr);
+  }
+  if (broadcast_value_to_index) {
+    xla::Shape index_shape = XlaHelpers::ShapeOfXlaOp(index);
+    std::vector<xla::int64> update_dimensions =
+        xla::util::ToVector<xla::int64>(buffer_shape.dimensions());
+    update_dimensions[dim] = index_shape.dimensions(0);
+    updates = xla::Broadcast(updates, update_dimensions);
+  }
+  // Create a combiner computation for the scatter.
+  xla::XlaComputation combiner_computation =
+      MakeScatterComputation(combiner, buffer_shape.element_type());
+  return xla::Scatter(buffer, index, updates, combiner_computation,
+                      dim_numbers);
+}
+
 }  // namespace
 
 std::vector<xla::XlaOp> CreateKthValue(const xla::XlaOp& input, xla::int64 k,
@@ -104,7 +161,9 @@ std::vector<xla::XlaOp> CreateKthValue(const xla::XlaOp& input, xla::int64 k,
     indices = xla::Reshape(indices, reshape_sizes);
   }
   // aten::kthvalue() wants Long tensors as indices.
-  return {values, xla::ConvertElementType(indices, xla::PrimitiveType::S64)};
+  return {values, xla::ConvertElementType(
+                      indices, GetDevicePrimitiveType(xla::PrimitiveType::S64,
+                                                      /*device=*/nullptr))};
 }
 
 std::vector<xla::XlaOp> CreateTopK(const xla::XlaOp& input, xla::int64 k,
@@ -138,7 +197,9 @@ std::vector<xla::XlaOp> CreateTopK(const xla::XlaOp& input, xla::int64 k,
   xla::XlaOp indices = xla::Slice(xla::GetTupleElement(sort_result, 1),
                                   start_indices, limit_indices, strides);
   // aten::topk() wants Long tensors as indices.
-  return {values, xla::ConvertElementType(indices, xla::PrimitiveType::S64)};
+  return {values, xla::ConvertElementType(
+                      indices, GetDevicePrimitiveType(xla::PrimitiveType::S64,
+                                                      /*device=*/nullptr))};
 }
 
 xla::XlaOp CreateMatMul(const xla::XlaOp& lhs, const xla::XlaOp& rhs) {
@@ -187,21 +248,50 @@ xla::XlaOp CreateMatMul(const xla::XlaOp& lhs, const xla::XlaOp& rhs) {
               << rhs_shape << ")";
 }
 
+xla::XlaOp BuildBernoulli(const xla::XlaOp& probability,
+                          const xla::Shape& shape) {
+  xla::Shape probability_shape = XlaHelpers::ShapeOfXlaOp(probability);
+  xla::XlaOp zero = XlaHelpers::ScalarValue<float>(
+      0, probability_shape.element_type(), probability.builder());
+  xla::XlaOp one = XlaHelpers::ScalarValue<float>(
+      1, probability_shape.element_type(), probability.builder());
+  xla::XlaOp noise = xla::RngUniform(zero, one, probability_shape);
+  return xla::ConvertElementType(xla::Lt(noise, probability),
+                                 shape.element_type());
+}
+
 xla::XlaOp BuildDropout(const xla::XlaOp& input, float probability) {
   xla::Shape shape = XlaHelpers::ShapeOfXlaOp(input);
-  xla::XlaOp zero =
-      XlaHelpers::ScalarValue<float>(0, shape.element_type(), input.builder());
-  xla::XlaOp one =
-      XlaHelpers::ScalarValue<float>(1, shape.element_type(), input.builder());
   xla::XlaOp prob =
       XlaHelpers::ScalarBroadcast<float>(probability, shape, input.builder());
-  xla::XlaOp noise = xla::RngUniform(zero, one, shape);
-  xla::XlaOp mask =
-      xla::ConvertElementType(xla::Lt(noise, prob), shape.element_type());
+  xla::XlaOp mask = BuildBernoulli(prob, shape);
   if (probability > 0.0f) {
     mask = mask / prob;
   }
   return input * mask;
+}
+
+xla::XlaOp BuildRandperm(xla::int64 n, xla::PrimitiveType element_type,
+                         xla::XlaBuilder* builder) {
+  xla::XlaOp input = xla::Iota(builder, element_type, n);
+  // Ensure that the key space is greater than or equal to the cube of the
+  // number of values to manage the number of collisions. Inspired by
+  // RandomShuffleOp in tf2xla, where the full rationale for picking the
+  // exponent value is described.
+  const int kExponent = 3;
+  const int rounds = static_cast<int>(
+      std::ceil(kExponent * std::log(n) / std::log(tensorflow::kuint32max)));
+  const xla::Shape key_shape = xla::ShapeUtil::MakeShape(xla::U32, {n});
+  xla::XlaOp zero = xla::ConstantR0(builder, 0U);
+  xla::XlaOp max_value = xla::ConstantR0(builder, tensorflow::kuint32max);
+
+  xla::XlaOp curr = input;
+  for (int i = 0; i < rounds; ++i) {
+    xla::XlaOp keys = xla::RngUniform(zero, max_value, key_shape);
+    xla::XlaOp sorted = xla::Sort(keys, {curr});
+    curr = xla::GetTupleElement(sorted, 1);
+  }
+  return curr;
 }
 
 std::vector<xla::XlaOp> CreateBroadcastTensors(
@@ -221,9 +311,10 @@ std::vector<xla::XlaOp> CreateBroadcastTensors(
   return result;
 }
 
-xla::XlaOp CreateIndex(const xla::XlaOp& input, const xla::XlaOp& indices) {
-  const xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(input);
-  const xla::Shape indices_shape = XlaHelpers::ShapeOfXlaOp(indices);
+xla::XlaOp CreateIndex(const xla::XlaOp& input, const xla::XlaOp& indices,
+                       xla::int64 start_dim) {
+  xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(input);
+  xla::Shape indices_shape = XlaHelpers::ShapeOfXlaOp(indices);
   XLA_CHECK_GE(indices_shape.rank(), 1);
   xla::int64 num_index_dims =
       indices_shape.dimensions(indices_shape.rank() - 1);
@@ -231,20 +322,143 @@ xla::XlaOp CreateIndex(const xla::XlaOp& input, const xla::XlaOp& indices) {
   std::vector<xla::int64> slice_sizes;
   slice_sizes.reserve(input_shape.rank());
   for (xla::int64 i = 0; i < input_shape.rank(); ++i) {
-    if (i < num_index_dims) {
+    if (i >= start_dim && i < num_index_dims + start_dim) {
       dim_numbers.add_collapsed_slice_dims(i);
       slice_sizes.push_back(1);
     } else {
       slice_sizes.push_back(input_shape.dimensions(i));
       xla::int64 indices_rank = indices_shape.rank() - 1;
-      dim_numbers.add_offset_dims(i + indices_rank - num_index_dims);
+      if (i < start_dim) {
+        dim_numbers.add_offset_dims(i);
+      } else {
+        dim_numbers.add_offset_dims(i - num_index_dims + indices_rank);
+      }
     }
   }
   dim_numbers.set_index_vector_dim(indices_shape.rank() - 1);
   for (xla::int64 i = 0; i < num_index_dims; i++) {
-    dim_numbers.add_start_index_map(i);
+    dim_numbers.add_start_index_map(i + start_dim);
   }
   return xla::Gather(input, indices, dim_numbers, slice_sizes);
+}
+
+xla::XlaOp CreateIndexUpdate(
+    const xla::XlaOp& buffer, const xla::XlaOp& indices, xla::int64 start_dim,
+    const xla::XlaOp& values,
+    const std::function<xla::XlaOp(xla::XlaOp, xla::XlaOp, xla::XlaBuilder*)>&
+        combiner) {
+  xla::Shape buffer_shape = XlaHelpers::ShapeOfXlaOp(buffer);
+  xla::Shape indices_shape = XlaHelpers::ShapeOfXlaOp(indices);
+  xla::Shape values_shape = XlaHelpers::ShapeOfXlaOp(values);
+
+  absl::Span<const xla::int64> indices_dims =
+      xla::AsInt64Slice(indices_shape.dimensions());
+  XLA_CHECK(!indices_dims.empty());
+  // The minor dimension of indices contains the indices to update.
+  xla::int64 num_index_dims = indices_dims.back();
+  indices_dims.remove_suffix(1);
+  xla::ScatterDimensionNumbers dim_numbers;
+  dim_numbers.set_index_vector_dim(indices_shape.rank() - 1);
+
+  xla::int64 values_rank = values_shape.rank();
+  xla::int64 buffer_rank = buffer_shape.rank();
+  xla::int64 num_window_dims_in_values = buffer_rank - num_index_dims;
+
+  // Make the values match the rank expected by scatter.
+  std::vector<xla::int64> expected_values_dims;
+  for (xla::int64 dim = 0; dim < start_dim; ++dim) {
+    expected_values_dims.push_back(buffer_shape.dimensions(dim));
+  }
+  expected_values_dims.insert(expected_values_dims.end(), indices_dims.begin(),
+                              indices_dims.end());
+  for (xla::int64 dim = num_index_dims + start_dim; dim < buffer_rank; ++dim) {
+    expected_values_dims.push_back(buffer_shape.dimensions(dim));
+  }
+  xla::XlaOp new_values = values;
+  if (buffer_shape.element_type() != values_shape.element_type()) {
+    new_values = ConvertTo(new_values, values_shape.element_type(),
+                           buffer_shape.element_type(), /*device=*/nullptr);
+  }
+  new_values = BuildExpand(new_values, expected_values_dims);
+  values_shape = XlaHelpers::ShapeOfXlaOp(new_values);
+  values_rank = values_shape.rank();
+
+  for (xla::int64 dim = 0; dim < start_dim; ++dim) {
+    dim_numbers.add_update_window_dims(dim);
+  }
+  for (xla::int64 i = values_rank - num_window_dims_in_values + start_dim;
+       i < values_rank; ++i) {
+    dim_numbers.add_update_window_dims(i);
+  }
+  for (xla::int64 i = 0; i < num_index_dims; ++i) {
+    dim_numbers.add_inserted_window_dims(i + start_dim);
+    dim_numbers.add_scatter_dims_to_operand_dims(i + start_dim);
+  }
+  xla::XlaComputation combiner_computation =
+      MakeScatterComputation(combiner, buffer_shape.element_type());
+  return xla::Scatter(buffer, indices, new_values, combiner_computation,
+                      dim_numbers);
+}
+
+xla::XlaOp CreateIndexAdd(const xla::XlaOp& buffer, xla::int64 dim,
+                          const xla::XlaOp& index, const xla::XlaOp& value) {
+  static std::function<xla::XlaOp(xla::XlaOp, xla::XlaOp, xla::XlaBuilder*)>
+      add_scatter_combiner =
+          [](const xla::XlaOp& x, const xla::XlaOp& y,
+             xla::XlaBuilder* builder) -> xla::XlaOp { return x + y; };
+  return CreateIndexAlongDim(buffer, dim, index, value,
+                             /*broadcast_value_to_index=*/false,
+                             add_scatter_combiner);
+}
+
+xla::XlaOp CreateIndexCopy(const xla::XlaOp& buffer, xla::int64 dim,
+                           const xla::XlaOp& index, const xla::XlaOp& value) {
+  return CreateIndexAlongDim(buffer, dim, index, value,
+                             /*broadcast_value_to_index=*/false, nullptr);
+}
+
+xla::XlaOp CreateIndexFill(const xla::XlaOp& buffer, xla::int64 dim,
+                           const xla::XlaOp& index, const xla::XlaOp& value) {
+  return CreateIndexAlongDim(buffer, dim, index, value,
+                             /*broadcast_value_to_index=*/true, nullptr);
+}
+
+xla::XlaOp CreateScatter(
+    const xla::XlaOp& input, const xla::XlaOp& index, const xla::XlaOp& src,
+    xla::int64 dim,
+    const std::function<xla::XlaOp(xla::XlaOp, xla::XlaOp, xla::XlaBuilder*)>&
+        combiner) {
+  xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(input);
+  xla::Shape index_shape = XlaHelpers::ShapeOfXlaOp(index);
+  xla::Shape src_shape = XlaHelpers::ShapeOfXlaOp(src);
+  XLA_CHECK_EQ(src_shape.rank(), index_shape.rank());
+  xla::XlaOp src_op = src;
+  if (src_shape.dimensions() != index_shape.dimensions()) {
+    std::vector<xla::int64> base_indices(src_shape.rank(), 0);
+    src_op = BuildSlice(src_op, base_indices, index_shape.dimensions());
+  }
+  xla::ShapeUtil::AppendMajorDimension(1, &index_shape);
+  std::vector<xla::XlaOp> to_concat;
+  to_concat.reserve(input_shape.rank());
+  for (xla::int64 i = 0; i < input_shape.rank(); ++i) {
+    if (i == dim) {
+      to_concat.push_back(xla::Reshape(index, index_shape.dimensions()));
+    } else {
+      to_concat.push_back(xla::Iota(input.builder(), index_shape, i));
+    }
+  }
+  xla::XlaOp scatter_indices =
+      xla::ConcatInDim(input.builder(), to_concat, input_shape.rank());
+  xla::ScatterDimensionNumbers scatter_dnums;
+  scatter_dnums.set_index_vector_dim(input_shape.rank());
+  for (xla::int64 i = 0; i < input_shape.rank(); ++i) {
+    scatter_dnums.add_inserted_window_dims(i);
+    scatter_dnums.add_scatter_dims_to_operand_dims(i);
+  }
+  return xla::Scatter(
+      input, scatter_indices, src_op,
+      MakeScatterComputation(combiner, input_shape.element_type()),
+      scatter_dnums);
 }
 
 }  // namespace torch_xla

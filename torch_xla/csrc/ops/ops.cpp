@@ -3,6 +3,8 @@
 #include <cmath>
 
 #include "tensorflow/compiler/xla/client/lib/math.h"
+#include "tensorflow/compiler/xla/client/lib/matrix.h"
+#include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "torch_xla/csrc/convert_ops.h"
@@ -11,8 +13,14 @@
 #include "torch_xla/csrc/helpers.h"
 #include "torch_xla/csrc/lowering_context.h"
 #include "torch_xla/csrc/nll_loss.h"
+#include "torch_xla/csrc/ops/arithmetic_ir_ops.h"
 #include "torch_xla/csrc/ops/constant.h"
+#include "torch_xla/csrc/ops/expand.h"
 #include "torch_xla/csrc/ops/infer_output_shape.h"
+#include "torch_xla/csrc/ops/log_softmax_backward.h"
+#include "torch_xla/csrc/ops/permute.h"
+#include "torch_xla/csrc/ops/softmax_backward.h"
+#include "torch_xla/csrc/ops/sum.h"
 #include "torch_xla/csrc/pooling.h"
 #include "torch_xla/csrc/tensor_util.h"
 #include "torch_xla/csrc/xla_lower_util.h"
@@ -32,16 +40,27 @@ namespace ops {
                      std::move(lower_fn));                        \
   }
 
-#define PTXLA_BINARY_OP(name, sym, xla_fn)                                \
-  NodePtr name(const Value& input0, const Value& input1) {                \
-    auto lower_fn = [](const Node& node,                                  \
-                       LoweringContext* loctx) -> XlaOpVector {           \
-      xla::XlaOp xla_input0 = loctx->GetOutputOp(node.operand(0));        \
-      xla::XlaOp xla_input1 = loctx->GetOutputOp(node.operand(1));        \
-      return node.ReturnOp(xla_fn(xla_input0, xla_input1), loctx);        \
-    };                                                                    \
-    return GenericOp(OpKind(sym), OpList{input0, input1}, input0.shape(), \
-                     std::move(lower_fn));                                \
+#define PTXLA_BINARY_OP(name, sym, xla_fn)                                     \
+  NodePtr name(const Value& input0, const Value& input1) {                     \
+    auto shape_fn =                                                            \
+        [&](tensorflow::gtl::ArraySlice<const xla::XlaOp> operands)            \
+        -> xla::XlaOp {                                                        \
+      auto promoted = XlaHelpers::Promote(operands[0], operands[1]);           \
+      return xla_fn(promoted.first, promoted.second);                          \
+    };                                                                         \
+    auto lower_fn = [](const Node& node,                                       \
+                       LoweringContext* loctx) -> XlaOpVector {                \
+      xla::XlaOp xla_input0 = loctx->GetOutputOp(node.operand(0));             \
+      xla::XlaOp xla_input1 = loctx->GetOutputOp(node.operand(1));             \
+      auto promoted = XlaHelpers::Promote(xla_input0, xla_input1);             \
+      return node.ReturnOp(xla_fn(promoted.first, promoted.second), loctx);    \
+    };                                                                         \
+    return GenericOp(                                                          \
+        OpKind(sym), OpList{input0, input1},                                   \
+        [&]() {                                                                \
+          return InferOutputShape({input0.shape(), input1.shape()}, shape_fn); \
+        },                                                                     \
+        std::move(lower_fn));                                                  \
   }
 
 PTXLA_UNARY_OP(Acos, at::aten::acos, xla::Acos);
@@ -73,16 +92,29 @@ PTXLA_BINARY_OP(Pow, at::aten::pow, xla::Pow);
 PTXLA_BINARY_OP(Fmod, at::aten::fmod, xla::Rem);
 PTXLA_BINARY_OP(Atan2, at::aten::atan2, xla::Atan2);
 
+NodePtr Trunc(const Value& input) { return Floor(Abs(input)) * SignOp(input); }
+
+NodePtr FracOp(const Value& input) {
+  auto lower_fn = [](const Node& node, LoweringContext* loctx) -> XlaOpVector {
+    xla::XlaOp xla_input = loctx->GetOutputOp(node.operand(0));
+    xla::XlaOp xla_input_floor = xla::Floor(xla_input);
+    return node.ReturnOp(xla_input - xla_input_floor, loctx);
+  };
+  return GenericOp(OpKind(at::aten::frac), OpList{input}, input.shape(),
+                   std::move(lower_fn));
+}
+
 NodePtr LogBase(const Value& input, OpKind op, double base) {
   auto lower_fn = [base](const Node& node,
                          LoweringContext* loctx) -> XlaOpVector {
     xla::XlaOp xla_input = loctx->GetOutputOp(node.operand(0));
     xla::XlaOp result = xla::Log(xla_input);
-    xla::XlaOp ln2 = XlaHelpers::ScalarValue<float>(
+    xla::XlaOp ln_base = XlaHelpers::ScalarValue<float>(
         1.0 / std::log(base), node.shape().element_type(), xla_input.builder());
-    return node.ReturnOp(result * ln2, loctx);
+    return node.ReturnOp(result * ln_base, loctx);
   };
-  return GenericOp(op, OpList{input}, input.shape(), std::move(lower_fn));
+  return GenericOp(op, OpList{input}, input.shape(), std::move(lower_fn),
+                   /*num_outputs=*/1, xla::util::MHash(base));
 }
 
 NodePtr ReciprocalOp(const Value& input) {
@@ -120,21 +152,30 @@ NodePtr ReluOp(const Value& input) {
                    std::move(lower_fn));
 }
 
-NodePtr TransposeOp(const Value& input) {
-  auto lower_fn = [](const Node& node, LoweringContext* loctx) -> XlaOpVector {
-    xla::XlaOp xla_input = loctx->GetOutputOp(node.operand(0));
-    xla::XlaOp xla_output = xla::Transpose(xla_input, {1, 0});
-    return node.ReturnOp(xla_output, loctx);
-  };
-  auto lower_for_shape_fn =
-      [](tensorflow::gtl::ArraySlice<const xla::XlaOp> operands) -> xla::XlaOp {
-    XLA_CHECK_EQ(operands.size(), 1) << "Unexpected number of operands";
-    return xla::Transpose(operands[0], {1, 0});
-  };
-  xla::Shape output_shape =
-      InferOutputShape({input.shape()}, lower_for_shape_fn);
-  return GenericOp(OpKind(at::aten::t), OpList{input}, output_shape,
-                   std::move(lower_fn));
+NodePtr TransposeOp(const Value& input, xla::int64 dim0, xla::int64 dim1) {
+  return ir::MakeNode<Permute>(input, XlaHelpers::MakeTransposePermutation(
+                                          /*dim0=*/dim0, /*dim1=*/dim1,
+                                          /*rank=*/input.shape().rank()));
+}
+
+std::tuple<NodePtr, NodePtr> LogSigmoid(const Value& input) {
+  // Use log-sum-exp trick to avoid overflow.
+  NodePtr neg_input = Neg(input);
+  NodePtr max_elem = Max(ScalarOp(0, input.shape()), neg_input);
+  NodePtr buffer = Exp(Neg(max_elem)) + Exp(neg_input - max_elem);
+  NodePtr output = Neg(max_elem + Log(buffer));
+  return std::make_tuple(output, buffer);
+}
+
+NodePtr LogSigmoidBackward(const Value& grad_output, const Value& input,
+                           const Value& buffer) {
+  NodePtr zero = ScalarOp(0, input.shape());
+  NodePtr one = ScalarOp(1, input.shape());
+  NodePtr minus_one = ScalarOp(-1, input.shape());
+  NodePtr max_deriv =
+      Where(ComparisonOp(at::aten::lt, input, zero), minus_one, zero);
+  NodePtr sign = Where(ComparisonOp(at::aten::lt, input, zero), one, minus_one);
+  return grad_output * (Neg(max_deriv) - sign * (buffer - one) / buffer);
 }
 
 NodePtr Sigmoid(const Value& input) {
@@ -146,27 +187,33 @@ NodePtr Sigmoid(const Value& input) {
                    std::move(lower_fn));
 }
 
-NodePtr Clamp(const Value& input, c10::optional<at::Scalar> min,
-              c10::optional<at::Scalar> max) {
-  const xla::Shape& input_shape = input.shape();
-  XlaHelpers::MinMax min_max =
-      XlaHelpers::MinMaxValues(input_shape.element_type());
-  if (!min) {
-    min = min_max.min;
-  }
-  if (!max) {
-    max = min_max.max;
-  }
-  NodePtr min_value = ScalarOp(*min, input_shape.element_type());
-  NodePtr max_value = ScalarOp(*max, input_shape.element_type());
+NodePtr SigmoidBackward(const Value& grad_output, const Value& output) {
+  return grad_output * (ScalarOp(1, output.shape()) - output) * output;
+}
+
+NodePtr LogSoftmaxBackwardOp(const Value& grad_output, const Value& output,
+                             xla::int64 dim) {
+  return ir::MakeNode<LogSoftmaxBackward>(
+      grad_output, output,
+      XlaHelpers::GetCanonicalDimensionIndex(dim, grad_output.shape().rank()));
+}
+
+NodePtr SoftmaxBackwardOp(const Value& grad_output, const Value& output,
+                          xla::int64 dim) {
+  return ir::MakeNode<SoftmaxBackward>(
+      grad_output, output,
+      XlaHelpers::GetCanonicalDimensionIndex(dim, grad_output.shape().rank()));
+}
+
+NodePtr Clamp(const Value& input, const Value& min, const Value& max) {
   auto lower_fn = [](const Node& node, LoweringContext* loctx) -> XlaOpVector {
     xla::XlaOp xla_input = loctx->GetOutputOp(node.operand(0));
     xla::XlaOp xla_min = loctx->GetOutputOp(node.operand(1));
     xla::XlaOp xla_max = loctx->GetOutputOp(node.operand(2));
     return node.ReturnOp(xla::Clamp(xla_min, xla_input, xla_max), loctx);
   };
-  return GenericOp(OpKind(at::aten::clamp), OpList{input, min_value, max_value},
-                   input_shape, std::move(lower_fn));
+  return GenericOp(OpKind(at::aten::clamp), OpList{input, min, max},
+                   input.shape(), std::move(lower_fn));
 }
 
 NodePtr AddMatMulOp(const Value& input, const Value& weight,
@@ -313,8 +360,7 @@ NodePtr ComparisonOp(c10::Symbol kind, const Value& input, const Value& other) {
                    std::move(lower_fn));
 }
 
-NodePtr ComparisonOp(c10::Symbol kind, const Value& input,
-                     const at::Scalar& other) {
+NodePtr ComparisonOp(c10::Symbol kind, const Value& input, at::Scalar other) {
   return ComparisonOp(kind, input, MakeNode<Scalar>(other, input.shape()));
 }
 
@@ -326,15 +372,17 @@ NodePtr Where(const Value& condition, const Value& input, const Value& other) {
     xla::XlaOp pred_condition =
         ConvertTo(xla_condition, XlaHelpers::TypeOfXlaOp(xla_condition),
                   xla::PrimitiveType::PRED, /*device=*/nullptr);
-    return node.ReturnOp(xla::Select(pred_condition, xla_input, xla_other),
+    auto promoted_branches = XlaHelpers::PromoteShapes(xla_input, xla_other);
+    return node.ReturnOp(xla::Select(pred_condition, promoted_branches.first,
+                                     promoted_branches.second),
                          loctx);
   };
   return GenericOp(OpKind(at::aten::where), {condition, input, other},
                    input.shape(), std::move(lower_fn));
 }
 
-NodePtr ARange(const at::Scalar& start, const at::Scalar& end,
-               const at::Scalar& step, at::ScalarType scalar_type) {
+NodePtr ARange(at::Scalar start, at::Scalar end, at::Scalar step,
+               at::ScalarType scalar_type) {
   xla::PrimitiveType type = MakeXlaPrimitiveType(scalar_type,
                                                  /*device=*/nullptr);
   xla::Literal values;
@@ -400,6 +448,152 @@ NodePtr BroadcastTensors(tensorflow::gtl::ArraySlice<const Value> tensors) {
   return GenericOp(OpKind(at::aten::broadcast_tensors), tensors,
                    InferOutputShape(tensor_shapes, lower_for_shape_fn),
                    std::move(lower_fn), /*num_outputs=*/tensors.size());
+}
+
+NodePtr Norm(const Value& input, c10::optional<at::Scalar> p,
+             c10::optional<at::ScalarType> dtype,
+             tensorflow::gtl::ArraySlice<const xla::int64> dims, bool keepdim) {
+  auto dimensions = xla::util::ToVector<xla::int64>(dims);
+  if (dimensions.empty()) {
+    dimensions = xla::util::Iota<xla::int64>(input.shape().rank());
+  }
+  if (!p.has_value() || p->toDouble() == 2.0) {
+    NodePtr square = input * input;
+    NodePtr result = MakeNode<Sum>(square, dimensions, keepdim, dtype);
+    return Sqrt(result);
+  }
+  double norm_value = p->toDouble();
+  if (norm_value == 1.0) {
+    // Contrary to documentation, norm(p=1) has nothing to do with traces and
+    // standard mathematical definitions of nuclear norms:
+    //
+    //   >>> import torch
+    //   >>> x = torch.randn(4, 4)
+    //   >>> print(torch.norm(x, 1))
+    //   tensor(11.9437)
+    //   >>> print(torch.trace(x.abs()))
+    //   tensor(3.1235)
+    //   >>> print(x.abs().sum())
+    //   tensor(11.9437)
+    return MakeNode<Sum>(Abs(input), dimensions, keepdim, dtype);
+  }
+  // Generic sum(x^p)^(1/p) norms.
+  NodePtr norm_exp = ScalarOp(norm_value, input.shape().element_type());
+  NodePtr norm_exp_inv =
+      ScalarOp(1.0 / norm_value, input.shape().element_type());
+  NodePtr exp = Pow(Abs(input), norm_exp);
+  NodePtr result = MakeNode<Sum>(exp, dimensions, keepdim, dtype);
+  return Pow(result, norm_exp_inv);
+}
+
+NodePtr Identity(xla::int64 lines, xla::int64 cols,
+                 xla::PrimitiveType element_type) {
+  auto lower_fn = [=](const Node& node, LoweringContext* loctx) -> XlaOpVector {
+    return node.ReturnOp(
+        xla::IdentityMatrix(loctx->builder(), element_type, lines, cols),
+        loctx);
+  };
+  return GenericOp(OpKind(at::aten::eye),
+                   xla::ShapeUtil::MakeShape(element_type, {lines, cols}),
+                   std::move(lower_fn), /*num_outputs=*/1,
+                   xla::util::MHash(lines, cols));
+}
+
+NodePtr Elu(const Value& input, at::Scalar alpha, at::Scalar scale,
+            at::Scalar input_scale) {
+  const xla::Shape& shape = input.shape();
+  NodePtr scaled_input = input * ScalarOp(input_scale, shape);
+  NodePtr zero = ScalarOp(0, shape);
+  NodePtr one = ScalarOp(1, shape);
+  NodePtr alpha_scalar = ScalarOp(alpha, shape);
+  return Where(ir::ops::ComparisonOp(at::aten::le, input, zero),
+               alpha_scalar * (Exp(scaled_input) - one), input) *
+         ScalarOp(scale, shape);
+}
+
+NodePtr EluBackward(const Value& grad_output, const Value& output,
+                    at::Scalar alpha, at::Scalar scale,
+                    at::Scalar input_scale) {
+  const xla::Shape& shape = grad_output.shape();
+  NodePtr negative_output_branch =
+      ScalarOp(input_scale, shape) *
+      (output + ScalarOp(alpha, shape) * ScalarOp(scale, shape));
+  NodePtr positive_output_branch = ScalarOp(scale, shape);
+  return grad_output *
+         Where(ComparisonOp(at::aten::gt, output, ScalarOp(0, shape)),
+               positive_output_branch, negative_output_branch);
+}
+
+NodePtr Lshift(const Value& input, at::Scalar other) {
+  return input * ScalarOp(pow(2, other.to<double>()), input.shape());
+}
+
+NodePtr Lshift(const Value& input, const Value& other) {
+  return input * Pow(ScalarOp(2, input.shape()), other);
+}
+
+NodePtr Rshift(const Value& input, at::Scalar other) {
+  return input / ScalarOp(pow(2, other.to<double>()), input.shape());
+}
+
+NodePtr Rshift(const Value& input, const Value& other) {
+  return input / Pow(ScalarOp(2, input.shape()), other);
+}
+
+NodePtr Remainder(const Value& input, const Value& divisor) {
+  NodePtr f = Fmod(input, Abs(divisor));
+  return f + divisor * ComparisonOp(at::aten::lt, SignOp(f) * SignOp(divisor),
+                                    ScalarOp(0, input.shape()));
+}
+
+NodePtr MaxUnary(const Value& input) {
+  auto lower_fn = [](const Node& node, LoweringContext* loctx) -> XlaOpVector {
+    xla::XlaOp xla_input = loctx->GetOutputOp(node.operand(0));
+    xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(xla_input);
+    xla::PrimitiveType element_type = input_shape.element_type();
+    XlaHelpers::MinMax min_max = XlaHelpers::MinMaxValues(element_type);
+    xla::XlaOp init_value =
+        XlaHelpers::ScalarValue(min_max.min, element_type, loctx->builder());
+    xla::XlaOp result = xla::Reduce(
+        xla_input, init_value, XlaHelpers::CreateMaxComputation(element_type),
+        xla::util::Iota<xla::int64>(input_shape.rank()));
+    return node.ReturnOp(xla::Reshape(result, {}), loctx);
+  };
+  return GenericOp(OpKind(at::aten::max), {input},
+                   xla::ShapeUtil::MakeShape(input.shape().element_type(), {}),
+                   std::move(lower_fn));
+}
+
+NodePtr MinUnary(const Value& input) {
+  auto lower_fn = [](const Node& node, LoweringContext* loctx) -> XlaOpVector {
+    xla::XlaOp xla_input = loctx->GetOutputOp(node.operand(0));
+    xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(xla_input);
+    xla::PrimitiveType element_type = input_shape.element_type();
+    XlaHelpers::MinMax min_max = XlaHelpers::MinMaxValues(element_type);
+    xla::XlaOp init_value =
+        XlaHelpers::ScalarValue(min_max.max, element_type, loctx->builder());
+    xla::XlaOp result = xla::Reduce(
+        xla_input, init_value, XlaHelpers::CreateMinComputation(element_type),
+        xla::util::Iota<xla::int64>(input_shape.rank()));
+    return node.ReturnOp(xla::Reshape(result, {}), loctx);
+  };
+  return GenericOp(OpKind(at::aten::min), {input},
+                   xla::ShapeUtil::MakeShape(input.shape().element_type(), {}),
+                   std::move(lower_fn));
+}
+
+NodePtr Bernoulli(const Value& input, const Value& probability) {
+  auto lower_fn = [](const Node& node, LoweringContext* loctx) -> XlaOpVector {
+    xla::XlaOp xla_input = loctx->GetOutputOp(node.operand(0));
+    xla::XlaOp xla_probability = loctx->GetOutputOp(node.operand(1));
+    xla::XlaOp result =
+        BuildBernoulli(xla_probability, XlaHelpers::ShapeOfXlaOp(xla_input));
+    return node.ReturnOp(result, loctx);
+  };
+  NodePtr probability_expanded =
+      ir::MakeNode<ir::ops::Expand>(probability, input.shape().dimensions());
+  return GenericOp(OpKind(at::aten::bernoulli), {input, probability_expanded},
+                   input.shape(), std::move(lower_fn));
 }
 
 }  // namespace ops

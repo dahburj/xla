@@ -33,16 +33,24 @@ xla::Shape NodeOutputShape(
 
 }  // namespace
 
-Conv2dBackward::Conv2dBackward(
-    const Value& grad_output, const Value& input, const Value& weight,
-    tensorflow::gtl::ArraySlice<const xla::int64> stride,
-    tensorflow::gtl::ArraySlice<const xla::int64> padding)
-    : Node(ir::OpKind(at::aten::thnn_conv2d_backward),
-           {grad_output, input, weight},
-           NodeOutputShape(grad_output, input, weight, stride, padding),
-           /*num_outputs=*/3, xla::util::MHash(stride, padding)),
-      stride_(stride.begin(), stride.end()),
-      padding_(padding.begin(), padding.end()) {}
+Conv2dBackward::Conv2dBackward(const Value& grad_output, const Value& input,
+                               const Value& weight,
+                               std::vector<xla::int64> stride,
+                               std::vector<xla::int64> padding)
+    : Node(
+          ir::OpKind(at::aten::thnn_conv2d_backward),
+          {grad_output, input, weight},
+          [&]() {
+            return NodeOutputShape(grad_output, input, weight, stride, padding);
+          },
+          /*num_outputs=*/3, xla::util::MHash(stride, padding)),
+      stride_(std::move(stride)),
+      padding_(std::move(padding)) {}
+
+NodePtr Conv2dBackward::Clone(OpList operands) const {
+  return MakeNode<Conv2dBackward>(operands.at(0), operands.at(1),
+                                  operands.at(2), stride_, padding_);
+}
 
 XlaOpVector Conv2dBackward::Lower(LoweringContext* loctx) const {
   xla::XlaOp grad_output = loctx->GetOutputOp(operand(0));

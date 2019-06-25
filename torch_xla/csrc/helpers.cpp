@@ -63,6 +63,15 @@ xla::int64 XlaHelpers::GetCanonicalDimensionIndex(xla::int64 dim,
   return dim_index;
 }
 
+std::vector<xla::int64> XlaHelpers::GetCanonicalDimensionIndices(
+    tensorflow::gtl::ArraySlice<const xla::int64> dimensions, xla::int64 rank) {
+  std::vector<xla::int64> canonical_dim_indices;
+  for (xla::int64 dim : dimensions) {
+    canonical_dim_indices.push_back(GetCanonicalDimensionIndex(dim, rank));
+  }
+  return canonical_dim_indices;
+}
+
 xla::int64 XlaHelpers::GetCanonicalPosition(
     tensorflow::gtl::ArraySlice<const xla::int64> dimensions, xla::int64 dim,
     xla::int64 pos) {
@@ -78,57 +87,41 @@ xla::int64 XlaHelpers::GetCanonicalPosition(
 XlaHelpers::MinMax XlaHelpers::MinMaxValues(xla::PrimitiveType type) {
   switch (type) {
     case xla::PrimitiveType::S8:
-      return {std::numeric_limits<xla::int8>::min(),
+      return {std::numeric_limits<xla::int8>::lowest(),
               std::numeric_limits<xla::int8>::max()};
     case xla::PrimitiveType::U8:
-      return {std::numeric_limits<xla::uint8>::min(),
+      return {std::numeric_limits<xla::uint8>::lowest(),
               std::numeric_limits<xla::uint8>::max()};
     case xla::PrimitiveType::S16:
-      return {std::numeric_limits<xla::int16>::min(),
+      return {std::numeric_limits<xla::int16>::lowest(),
               std::numeric_limits<xla::int16>::max()};
     case xla::PrimitiveType::U16:
-      return {std::numeric_limits<xla::uint16>::min(),
+      return {std::numeric_limits<xla::uint16>::lowest(),
               std::numeric_limits<xla::uint16>::max()};
     case xla::PrimitiveType::S32:
-      return {static_cast<int64_t>(std::numeric_limits<xla::int32>::min()),
+      return {static_cast<int64_t>(std::numeric_limits<xla::int32>::lowest()),
               static_cast<int64_t>(std::numeric_limits<xla::int32>::max())};
     case xla::PrimitiveType::U32:
-      return {static_cast<int64_t>(std::numeric_limits<xla::uint32>::min()),
+      return {static_cast<int64_t>(std::numeric_limits<xla::uint32>::lowest()),
               static_cast<int64_t>(std::numeric_limits<xla::uint32>::max())};
     case xla::PrimitiveType::S64:
-      return {static_cast<int64_t>(std::numeric_limits<xla::int64>::min()),
+      return {static_cast<int64_t>(std::numeric_limits<xla::int64>::lowest()),
               static_cast<int64_t>(std::numeric_limits<xla::int64>::max())};
     case xla::PrimitiveType::U64:
-      return {static_cast<int64_t>(std::numeric_limits<xla::uint64>::min()),
+      return {static_cast<int64_t>(std::numeric_limits<xla::uint64>::lowest()),
               static_cast<int64_t>(std::numeric_limits<xla::uint64>::max())};
     case xla::PrimitiveType::BF16:
     case xla::PrimitiveType::F32:
-      return {std::numeric_limits<float>::min(),
+      return {std::numeric_limits<float>::lowest(),
               std::numeric_limits<float>::max()};
     case xla::PrimitiveType::F64:
-      return {std::numeric_limits<double>::min(),
+      return {std::numeric_limits<double>::lowest(),
               std::numeric_limits<double>::max()};
     case xla::PrimitiveType::PRED:
       return {0, 1};
     default:
       XLA_ERROR() << "Unsupported XLA type " << type;
   }
-}
-
-xla::PaddingConfig XlaHelpers::MakeXlaPaddingConfig(
-    tensorflow::gtl::ArraySlice<const xla::int64> padding) {
-  XLA_CHECK_EQ(padding.size(), 2) << "Only 2D padding supported";
-  xla::PaddingConfig padding_config;
-  for (int i = 0; i < 2; ++i) {
-    padding_config.add_dimensions();
-  }
-  for (int i = 0; i < 2; ++i) {
-    xla::PaddingConfig::PaddingConfigDimension* dims =
-        padding_config.add_dimensions();
-    dims->set_edge_padding_low(padding[i]);
-    dims->set_edge_padding_high(padding[i]);
-  }
-  return padding_config;
 }
 
 xla::PaddingConfig XlaHelpers::MakeXlaPaddingConfigFromNdPadding(
@@ -176,6 +169,16 @@ xla::XlaComputation XlaHelpers::CreateMaxComputation(xla::PrimitiveType type) {
   return ConsumeValue(builder.Build());
 }
 
+xla::XlaComputation XlaHelpers::CreateMinComputation(xla::PrimitiveType type) {
+  xla::XlaBuilder builder("MinComputation");
+  xla::XlaOp x =
+      xla::Parameter(&builder, 0, xla::ShapeUtil::MakeShape(type, {}), "x");
+  xla::XlaOp y =
+      xla::Parameter(&builder, 1, xla::ShapeUtil::MakeShape(type, {}), "y");
+  xla::Min(x, y);
+  return ConsumeValue(builder.Build());
+}
+
 xla::Shape XlaHelpers::ShapeOfXlaOp(const xla::XlaOp& op) {
   return ConsumeValue(op.builder()->GetShape(op));
 }
@@ -188,6 +191,31 @@ std::vector<xla::int64> XlaHelpers::SizesOfXlaOp(const xla::XlaOp& op) {
 
 xla::PrimitiveType XlaHelpers::TypeOfXlaOp(const xla::XlaOp& op) {
   return ShapeOfXlaOp(op).element_type();
+}
+
+xla::XlaOp XlaHelpers::ReshapeToRank(const xla::XlaOp& input,
+                                     xla::int64 expected_rank,
+                                     xla::int64 offset) {
+  xla::Shape shape = ShapeOfXlaOp(input);
+  XLA_CHECK_LE(offset + shape.rank(), expected_rank);
+  if (shape.rank() == expected_rank) {
+    return input;
+  }
+  std::vector<xla::int64> dimensions(expected_rank - offset - shape.rank(), 1);
+  dimensions.insert(dimensions.end(), shape.dimensions().begin(),
+                    shape.dimensions().end());
+  dimensions.insert(dimensions.end(), offset, 1);
+  return xla::Reshape(input, dimensions);
+}
+
+std::vector<xla::int64> XlaHelpers::MakeTransposePermutation(xla::int64 dim0,
+                                                             xla::int64 dim1,
+                                                             xla::int64 rank) {
+  xla::int64 canonical_dim0 = GetCanonicalDimensionIndex(dim0, rank);
+  xla::int64 canonical_dim1 = GetCanonicalDimensionIndex(dim1, rank);
+  auto permute_dims = xla::util::Iota<xla::int64>(rank);
+  std::swap(permute_dims[canonical_dim0], permute_dims[canonical_dim1]);
+  return permute_dims;
 }
 
 std::pair<xla::XlaOp, xla::XlaOp> XlaHelpers::PromoteValues(
@@ -210,6 +238,23 @@ std::pair<xla::XlaOp, xla::XlaOp> XlaHelpers::PromoteValues(
   if (xla::primitive_util::IsFloatingPointType(type2) || size2 >= size1) {
     return std::pair<xla::XlaOp, xla::XlaOp>(
         ConvertTo(op1, type1, type2, /*device=*/nullptr), op2);
+  }
+  if (xla::primitive_util::IsIntegralType(type1) &&
+      xla::primitive_util::IsIntegralType(type2)) {
+    if (size1 >= size2) {
+      return std::pair<xla::XlaOp, xla::XlaOp>(
+          op1, ConvertTo(op2, type2, type1, /*device=*/nullptr));
+    }
+    return std::pair<xla::XlaOp, xla::XlaOp>(
+        ConvertTo(op1, type1, type2, /*device=*/nullptr), op2);
+  }
+  if (type1 == xla::PrimitiveType::PRED) {
+    return std::pair<xla::XlaOp, xla::XlaOp>(
+        ConvertTo(op1, type1, type2, /*device=*/nullptr), op2);
+  }
+  if (type2 == xla::PrimitiveType::PRED) {
+    return std::pair<xla::XlaOp, xla::XlaOp>(
+        op1, ConvertTo(op2, type2, type1, /*device=*/nullptr));
   }
   return std::pair<xla::XlaOp, xla::XlaOp>(
       op1, ConvertTo(op2, type2, type1, /*device=*/nullptr));
@@ -328,7 +373,10 @@ xla::XlaOp XlaHelpers::PromotedBinaryOp(
     const xla::XlaOp& op1, const xla::XlaOp& op2,
     const std::function<xla::XlaOp(const xla::XlaOp&, const xla::XlaOp&)>&
         bin_op) {
-  std::pair<xla::XlaOp, xla::XlaOp> vops = PromoteSecond(op1, op2);
+  xla::XlaOp numeric_op1 = ConvertToNumeric(op1);
+  xla::XlaOp numeric_op2 = ConvertToNumeric(op2);
+  std::pair<xla::XlaOp, xla::XlaOp> vops =
+      PromoteSecond(numeric_op1, numeric_op2);
   return bin_op(vops.first, vops.second);
 }
 

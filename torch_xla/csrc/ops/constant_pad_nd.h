@@ -10,15 +10,16 @@ namespace ops {
 
 class ConstantPadNd : public Node {
  public:
-  ConstantPadNd(const Value& input,
-                tensorflow::gtl::ArraySlice<const xla::int64> pad,
-                const at::Scalar& value);
+  ConstantPadNd(const Value& input, std::vector<xla::int64> pad,
+                at::Scalar value);
 
   std::string ToString() const override;
 
+  NodePtr Clone(OpList operands) const override;
+
   XlaOpVector Lower(LoweringContext* loctx) const override;
 
-  const at::Scalar& value() const { return value_; }
+  at::Scalar value() const { return value_; }
 
   const std::vector<xla::int64> pad() const { return pad_; }
 

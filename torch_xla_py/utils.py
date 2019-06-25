@@ -2,7 +2,10 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import shutil
 import sys
+import tempfile
+import time
 
 
 class Cleaner(object):
@@ -14,16 +17,22 @@ class Cleaner(object):
     self.func()
 
 
+class TmpFolder(object):
+
+  def __init__(self):
+    self.name = tempfile.mkdtemp()
+    self.cleaner = Cleaner(lambda: shutil.rmtree(self.name))
+
+
 class SampleGenerator(object):
 
-  def __init__(self, data, target, sample_count):
+  def __init__(self, data, sample_count):
     self._data = data
-    self._target = target
     self._sample_count = sample_count
     self._count = 0
 
   def __iter__(self):
-    return SampleGenerator(self._data, self._target, self._sample_count)
+    return SampleGenerator(self._data, self._sample_count)
 
   def __len__(self):
     return self._sample_count
@@ -35,16 +44,16 @@ class SampleGenerator(object):
     if self._count >= self._sample_count:
       raise StopIteration
     self._count += 1
-    return self._data, self._target
+    return self._data
 
 
 class FnDataGenerator(object):
 
-  def __init__(self, func, batch_size, gen_tensor, dim=1, count=1):
+  def __init__(self, func, batch_size, gen_tensor, dims=None, count=1):
     self._func = func
     self._batch_size = batch_size
     self._gen_tensor = gen_tensor
-    self._dim = dim
+    self._dims = list(dims) if dims else [1]
     self._count = count
     self._emitted = 0
 
@@ -56,7 +65,7 @@ class FnDataGenerator(object):
         self._func,
         self._batch_size,
         self._gen_tensor,
-        dim=self._dim,
+        dims=self._dims,
         count=self._count)
 
   def __next__(self):
@@ -65,7 +74,7 @@ class FnDataGenerator(object):
   def next(self):
     if self._emitted >= self._count:
       raise StopIteration
-    data = self._gen_tensor(self._batch_size, self._dim)
+    data = self._gen_tensor(self._batch_size, *self._dims)
     target = self._func(data)
     self._emitted += 1
     return data, target
@@ -78,6 +87,18 @@ def as_list(t):
 def getenv_as(name, type, defval=None):
   env = os.environ.get(name, None)
   return defval if env is None else type(env)
+
+
+def for_each_instance(value, inst, fn):
+  if type(value) == inst:
+    fn(value)
+  elif isinstance(value, dict):
+    for k, v in value.items():
+      for_each_instance(k, inst, fn)
+      for_each_instance(v, inst, fn)
+  elif isinstance(value, (list, tuple, set)):
+    for x in value:
+      for_each_instance(x, inst, fn)
 
 
 def shape(inputs):
@@ -118,5 +139,38 @@ def eprint(*args, **kwargs):
   print(*args, file=sys.stderr, **kwargs)
 
 
-def get_print_fn(debug):
+def get_print_fn(debug=None):
+  if debug is None:
+    debug = int(os.environ.get('DEBUG', '0'))
   return eprint if debug else null_print
+
+
+def timed(fn, msg='', printfn=eprint):
+  if printfn is None:
+    printfn = get_print_fn()
+  s = time.time()
+  result = fn()
+  printfn('{}{:.3f}ms'.format(msg, 1000.0 * (time.time() - s)))
+  return result
+
+
+class TimedScope(object):
+
+  def __init__(self, msg='', printfn=eprint):
+    if printfn is None:
+      printfn = get_print_fn()
+    self._msg = msg
+    self._printfn = printfn
+    self._error = None
+
+  def __enter__(self):
+    self._start = time.time()
+    return self
+
+  def __exit__(self, type, value, traceback):
+    if self._error is None:
+      self._printfn('{}{:.3f}ms'.format(self._msg,
+                                        1000.0 * (time.time() - self._start)))
+
+  def set_error(self, error):
+    self._error = error

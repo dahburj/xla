@@ -13,12 +13,13 @@ namespace ir {
 namespace ops {
 
 Scalar::Scalar(at::Scalar value, xla::Shape shape)
-    : Node(OpKind(at::prim::Constant), shape, ScalarHash(value)),
+    : Node(OpKind(at::prim::Constant), shape, /*num_outputs=*/1,
+           ScalarHash(value)),
       value_(std::move(value)) {}
 
 Scalar::Scalar(at::Scalar value, xla::PrimitiveType type)
     : Node(OpKind(at::prim::Constant), xla::ShapeUtil::MakeShape(type, {}),
-           ScalarHash(value)),
+           /*num_outputs=*/1, ScalarHash(value)),
       value_(std::move(value)) {}
 
 std::string Scalar::ToString() const {
@@ -27,9 +28,16 @@ std::string Scalar::ToString() const {
   return ss.str();
 }
 
+NodePtr Scalar::Clone(OpList operands) const {
+  return MakeNode<Scalar>(value_, shape());
+}
+
 XlaOpVector Scalar::Lower(LoweringContext* loctx) const {
   xla::Literal literal(xla::ShapeUtil::MakeShape(shape().element_type(), {}));
   switch (shape().element_type()) {
+    case xla::PRED:
+      literal.Set<bool>({}, static_cast<bool>(value_.toInt()));
+      break;
     case xla::S8:
       literal.Set<xla::int8>({}, static_cast<xla::int8>(value_.toChar()));
       break;

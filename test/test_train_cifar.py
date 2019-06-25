@@ -3,16 +3,20 @@ import test_utils
 FLAGS = test_utils.parse_common_options(
     datadir='/tmp/cifar-data',
     batch_size=128,
-    num_epochs=15,
+    num_epochs=20,
+    momentum=0.9,
+    lr=0.1,
     target_accuracy=80.0)
 
 from common_utils import TestCase, run_tests
+import os
 import shutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch_xla
+import torch_xla_py.data_parallel as dp
 import torch_xla_py.utils as xu
 import torch_xla_py.xla_model as xm
 import torchvision
@@ -94,28 +98,35 @@ def train_cifar():
 
   if FLAGS.fake_data:
     train_loader = xu.SampleGenerator(
-        data=torch.zeros(FLAGS.batch_size, 3, 32, 32),
-        target=torch.zeros(FLAGS.batch_size, dtype=torch.int64),
+        data=(torch.zeros(FLAGS.batch_size, 3, 32,
+                          32), torch.zeros(FLAGS.batch_size,
+                                           dtype=torch.int64)),
         sample_count=50000 // FLAGS.batch_size)
     test_loader = xu.SampleGenerator(
-        data=torch.zeros(FLAGS.batch_size, 3, 32, 32),
-        target=torch.zeros(FLAGS.batch_size, dtype=torch.int64),
+        data=(torch.zeros(FLAGS.batch_size, 3, 32,
+                          32), torch.zeros(FLAGS.batch_size,
+                                           dtype=torch.int64)),
         sample_count=10000 // FLAGS.batch_size)
   else:
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
     ])
 
     transform_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
     ])
 
     trainset = torchvision.datasets.CIFAR10(
-        root=FLAGS.datadir, train=True, download=True, transform=transform_train)
+        root=FLAGS.datadir,
+        train=True,
+        download=True,
+        transform=transform_train)
     train_loader = torch.utils.data.DataLoader(
         trainset,
         batch_size=FLAGS.batch_size,
@@ -123,7 +134,10 @@ def train_cifar():
         num_workers=FLAGS.num_workers)
 
     testset = torchvision.datasets.CIFAR10(
-        root=FLAGS.datadir, train=False, download=True, transform=transform_test)
+        root=FLAGS.datadir,
+        train=False,
+        download=True,
+        transform=transform_test)
     test_loader = torch.utils.data.DataLoader(
         testset,
         batch_size=FLAGS.batch_size,
@@ -132,38 +146,52 @@ def train_cifar():
 
   torch.manual_seed(42)
 
-  print('==> Building model..')
-  momentum = 0.9
-  lr = 0.1
-  log_interval = max(1, int(10 / FLAGS.num_cores))
+  devices = xm.get_xla_supported_devices(max_devices=FLAGS.num_cores)
+  # Pass [] as device_ids to run using the PyTorch/CPU engine.
+  model_parallel = dp.DataParallel(ResNet18, device_ids=devices)
 
-  model = ResNet18()
+  def train_loop_fn(model, loader, device, context):
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=FLAGS.lr,
+        momentum=FLAGS.momentum,
+        weight_decay=5e-4)
+    tracker = xm.RateTracker()
 
-  devices = [':{}'.format(n) for n in range(0, FLAGS.num_cores)]
-  inputs = torch.zeros(FLAGS.batch_size, 3, 32, 32)
-  target = torch.zeros(FLAGS.batch_size, dtype=torch.int64)
-  xla_model = xm.XlaModel(
-      model, [inputs],
-      loss_fn=F.nll_loss,
-      target=target,
-      num_cores=FLAGS.num_cores,
-      devices=devices)
-  optimizer = optim.SGD(
-      xla_model.parameters_list(), lr=lr, momentum=momentum, weight_decay=5e-4)
+    for x, (data, target) in loader:
+      optimizer.zero_grad()
+      output = model(data)
+      loss = loss_fn(output, target)
+      loss.backward()
+      xm.optimizer_step(optimizer)
+      tracker.add(FLAGS.batch_size)
+      if x % FLAGS.log_steps == 0:
+        print('[{}]({}) Loss={:.5f} Rate={:.2f}'.format(device, x, loss.item(),
+                                                        tracker.rate()))
 
-  log_fn = xm.get_log_fn(logdir=FLAGS.logdir)
+  def test_loop_fn(model, loader, device, context):
+    total_samples = 0
+    correct = 0
+    for x, (data, target) in loader:
+      output = model(data)
+      pred = output.max(1, keepdim=True)[1]
+      correct += pred.eq(target.view_as(pred)).sum().item()
+      total_samples += data.size()[0]
+
+    print('[{}] Accuracy={:.2f}%'.format(device,
+                                         100.0 * correct / total_samples))
+    return correct / total_samples
+
+  accuracy = 0.0
   for epoch in range(1, FLAGS.num_epochs + 1):
-    xla_model.train(
-        train_loader,
-        optimizer,
-        FLAGS.batch_size,
-        log_interval=log_interval,
-        metrics_debug=FLAGS.metrics_debug,
-        log_fn=log_fn)
-    accuracy = xla_model.test(test_loader, xm.category_eval_fn(F.nll_loss),
-                              FLAGS.batch_size, log_fn=log_fn)
-    xm.update_optimizer_state(optimizer, 'lr', lambda x: x / 1.025)
-  return accuracy
+    model_parallel(train_loop_fn, train_loader)
+    accuracies = model_parallel(test_loop_fn, test_loader)
+    accuracy = sum(accuracies) / len(devices)
+    if FLAGS.metrics_debug:
+      print(torch_xla._XLAC._xla_metrics_report())
+
+  return accuracy * 100.0
 
 
 class TrainCIFAR10(TestCase):

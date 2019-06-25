@@ -6,7 +6,7 @@ set -e
 set -x
 
 function install_bazel() {
-  local BAZEL_VERSION="0.22.0"
+  local BAZEL_VERSION="0.24.1"
   local BAZEL_FILE="bazel-${BAZEL_VERSION}-installer-linux-x86_64.sh"
   sudo apt-get install pkg-config zip zlib1g-dev unzip
   curl -L -O "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/${BAZEL_FILE}"
@@ -45,7 +45,7 @@ sudo apt-get -y --purge autoremove mpi-default-dev
 sudo apt-get -y --purge autoremove openmpi-bin
 
 ## Install required packages for build
-sudo apt-get -y install python-pip git
+sudo apt-get -y install python-pip git libopenblas-dev
 sudo pip install --upgrade google-api-python-client
 sudo pip install --upgrade oauth2client
 
@@ -61,7 +61,11 @@ install_bazel
 conda create --name pytorch python=3.5 anaconda
 source activate pytorch
 export CMAKE_PREFIX_PATH="$(dirname $(which conda))/../"
-conda install -y numpy pyyaml mkl mkl-include setuptools cmake cffi typing
+conda install -y numpy pyyaml setuptools cmake cffi typing
+
+# Disable MKL because it's a clusterfsck
+# conda install -y mkl mkl-include
+
 sudo /sbin/ldconfig "${HOME}/anaconda3/lib/" "${HOME}/anaconda3/envs/pytorch/lib"
 
 # Install the Lark parser required for the XLA->ATEN Type code generation.
@@ -82,11 +86,15 @@ fi
 # Apply patches to PT which are required by the XLA support.
 xla/scripts/apply_patches.sh
 # Build and install torch wheel and collect artifact
-export NO_CUDA=1
+export NO_CUDA=1 NO_MKLDNN=1
 python setup.py bdist_wheel
 pip install dist/*.whl
+mkdir build_artifacts
+cp dist/* build_artifacts
 cd dist && rename "s/\+\w{7}/\+stable/" *.whl && cd ..
-mv dist/* ../../
+cd build_artifacts && rename "s/^torch/torch-$(date -d "yesterday" +%Y%m%d)/" *.whl && cd ..
+mv dist/* build_artifacts
+mv build_artifacts/* ../../
 
 # Execute torch_xla build
 cd xla

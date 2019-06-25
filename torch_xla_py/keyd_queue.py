@@ -14,6 +14,9 @@ class QueueBase(object):
     self._close_read = False
     self._close_write = False
 
+  def max_size(self):
+    return self._maxsize
+
   def close(self):
     with self._lock:
       self._close_read = True
@@ -54,7 +57,7 @@ class KeydQueue(QueueBase):
         self._ready_cv.wait()
         self._waited_keys.discard(key)
       item = self._items.pop(key, None)
-      if item is not None and not self._close_write:
+      if item is not None:
         self._space_available_cv.notify()
       return item
 
@@ -78,6 +81,6 @@ class Queue(QueueBase):
       while not self._items and not self._close_write:
         self._ready_cv.wait()
       item = self._items.popleft() if self._items else None
-      if item is not None and not self._close_write:
+      if item is not None:
         self._space_available_cv.notify()
       return item

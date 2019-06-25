@@ -1,18 +1,61 @@
 #ifndef TENSORFLOW_COMPILER_XLA_RPC_UTIL_H_
 #define TENSORFLOW_COMPILER_XLA_RPC_UTIL_H_
 
+#include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <numeric>
 #include <set>
+#include <type_traits>
 #include <vector>
 
 #include "absl/types/optional.h"
+#include "tensorflow/compiler/xla/status.h"
 #include "tensorflow/core/lib/gtl/array_slice.h"
 #include "tensorflow/core/lib/hash/hash.h"
 
 namespace xla {
 namespace util {
+
+template <typename T>
+class Cleanup {
+ public:
+  using StatusType = T;
+
+  explicit Cleanup(std::function<void(StatusType)> func)
+      : func_(std::move(func)) {}
+  Cleanup(Cleanup&& ref) : func_(std::move(ref.func_)) {}
+  Cleanup(const Cleanup&) = delete;
+
+  ~Cleanup() {
+    if (func_ != nullptr) {
+      func_(std::move(status_));
+    }
+  }
+
+  Cleanup& operator=(const Cleanup&) = delete;
+
+  Cleanup& operator=(Cleanup&& ref) {
+    if (this != &ref) {
+      func_ = std::move(ref.func_);
+    }
+    return *this;
+  }
+
+  void Release() { func_ = nullptr; }
+
+  void SetStatus(StatusType status) { status_ = std::move(status); }
+
+  const StatusType& GetStatus() const { return status_; }
+
+ private:
+  std::function<void(StatusType)> func_;
+  StatusType status_;
+};
+
+using ExceptionCleanup = Cleanup<std::exception_ptr>;
+using StatusCleanup = Cleanup<xla::Status>;
 
 // Allows APIs which might return const references and values, to not be forced
 // to return values in the signature.
@@ -84,9 +127,12 @@ std::vector<typename C::value_type::element_type*> GetSharedPointers(
 }
 
 template <typename T>
-std::vector<T> Iota(size_t size, T init = 0) {
+std::vector<T> Iota(size_t size, T init = 0, T incr = 1) {
   std::vector<T> result(size);
-  std::iota(result.begin(), result.end(), init);
+  T value = init;
+  for (size_t i = 0; i < size; ++i, value += incr) {
+    result[i] = value;
+  }
   return result;
 }
 
@@ -105,19 +151,38 @@ std::vector<T> ToVector(const S& input) {
   return std::vector<T>(input.begin(), input.end());
 }
 
+template <typename T>
+typename std::underlying_type<T>::type GetEnumValue(T value) {
+  return static_cast<typename std::underlying_type<T>::type>(value);
+}
+
 template <typename T, typename S>
 T Multiply(const S& input) {
   return std::accumulate(input.begin(), input.end(), T(1),
                          std::multiplies<T>());
 }
 
+static inline size_t DataHash(const void* data, size_t size) {
+  return tensorflow::Hash64(reinterpret_cast<const char*>(data), size,
+                            0x5a2d296e9);
+}
+
+static inline size_t StringHash(const char* data) {
+  return DataHash(data, std::strlen(data));
+}
+
 static inline size_t HashCombine(size_t a, size_t b) {
   return a ^ (b + 0x9e3779b97f4a7c15 + (a << 6) + (a >> 2));
 }
 
-template <typename T>
+template <typename T, typename std::enable_if<
+                          std::is_arithmetic<T>::value>::type* = nullptr>
 size_t Hash(const T& value) {
-  return std::hash<T>()(value);
+  return DataHash(&value, sizeof(value));
+}
+
+static inline size_t Hash(const std::string& value) {
+  return DataHash(value.data(), value.size());
 }
 
 // Forward declare to allow hashes of vectors of vectors to work.

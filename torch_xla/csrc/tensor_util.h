@@ -12,26 +12,8 @@
 #include "torch_xla/csrc/device.h"
 
 namespace torch_xla {
-namespace detail {
-
-// Checks whether BF16 should be used as default floating point type for XLA
-// computations.
-bool UseBF16();
-
-}  // namespace detail
 
 std::vector<xla::int64> ComputeShapeStrides(const xla::Shape& shape);
-
-// Create an XLA shape with the given dimensions and type, suitable to be used
-// in the specified device type. The type of device can affect the choice of the
-// XLA layout.
-xla::Shape MakeArrayShapeFromDimensions(
-    tensorflow::gtl::ArraySlice<const xla::int64> dimensions,
-    xla::PrimitiveType type, DeviceType device_type);
-
-xla::Shape MakeArrayShapeFromDimensions(const at::IntList& dimensions,
-                                        xla::PrimitiveType type,
-                                        DeviceType device_type);
 
 // Converts an XLA literal to an at::Tensor of the given element type.
 at::Tensor MakeTensorFromXlaLiteral(const xla::Literal& literal,
@@ -39,12 +21,14 @@ at::Tensor MakeTensorFromXlaLiteral(const xla::Literal& literal,
 
 // Uploads an ATEN tensor data to the device and fetches the corresponding
 // device data handle.
-std::shared_ptr<xla::ComputationClient::Data> TensorToXlaData(
-    const at::Tensor& tensor, const Device& device);
+xla::ComputationClient::DataPtr TensorToXlaData(const at::Tensor& tensor,
+                                                const Device& device);
+
+size_t TensorHash(const at::Tensor& tensor);
 
 // Retrieves the device data handles by parallel uploading data onto the
 // corresponding devices.
-std::vector<std::shared_ptr<xla::ComputationClient::Data>> CreateTensorsData(
+std::vector<xla::ComputationClient::DataPtr> CreateTensorsData(
     const std::vector<at::Tensor>& tensors,
     const std::vector<std::string>& devices);
 
@@ -69,6 +53,11 @@ xla::Shape CreateComputationShapeFromTensor(const at::Tensor& tensor,
                                             const Device* device);
 
 at::ScalarType TensorTypeFromXlaType(xla::PrimitiveType xla_type);
+
+// Maps an XLA type to the one which can be used on the given device (or the
+// default device, id device is nullptr).
+xla::PrimitiveType GetDevicePrimitiveType(xla::PrimitiveType type,
+                                          const Device* device);
 
 // Converts the given scalar type to an XLA primitive type.
 xla::PrimitiveType MakeXlaPrimitiveType(at::ScalarType scalar_type,

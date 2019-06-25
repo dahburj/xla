@@ -1,9 +1,9 @@
+#include <ATen/ATen.h>
 #include <gtest/gtest.h>
 
 #include <limits>
 #include <vector>
 
-#include <ATen/ATen.h>
 #include "cpp_test_util.h"
 #include "torch/csrc/autograd/variable.h"
 #include "torch_xla/csrc/tensor.h"
@@ -23,7 +23,7 @@ bool CheckBidirectionalConversion(
     literal = literal.Convert(*xla_type).ConsumeValueOrDie();
   }
   at::Tensor converted = MakeTensorFromXlaLiteral(literal, dest_element_type);
-  return EqualValues(converted, input);
+  return EqualValuesNoElementTypeCheck(converted, input);
 }
 
 }  // namespace
@@ -35,39 +35,39 @@ TEST_F(TensorTest, TestConversions) {
     at::Tensor a = at::randint(std::numeric_limits<uint8_t>::min(),
                                std::numeric_limits<uint8_t>::max(), {2, 2},
                                at::TensorOptions(at::kByte));
-    CheckBidirectionalConversion(a, at::ScalarType::Short);
-    CheckBidirectionalConversion(a, at::ScalarType::Int);
-    CheckBidirectionalConversion(a, at::ScalarType::Long);
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Short));
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Int));
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Long));
   }
   {
     at::Tensor a = at::randint(std::numeric_limits<int8_t>::min(),
                                std::numeric_limits<int8_t>::max(), {2, 2},
                                at::TensorOptions(at::kChar));
-    CheckBidirectionalConversion(a, at::ScalarType::Short);
-    CheckBidirectionalConversion(a, at::ScalarType::Int);
-    CheckBidirectionalConversion(a, at::ScalarType::Long);
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Short));
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Int));
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Long));
   }
   {
     at::Tensor a = at::randint(std::numeric_limits<int16_t>::min(),
                                std::numeric_limits<int16_t>::max(), {2, 2},
                                at::TensorOptions(at::kShort));
-    CheckBidirectionalConversion(a, at::ScalarType::Int);
-    CheckBidirectionalConversion(a, at::ScalarType::Long);
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Int));
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Long));
   }
   {
     at::Tensor a = at::randint(std::numeric_limits<int32_t>::min(),
                                std::numeric_limits<int32_t>::max(), {2, 2},
                                at::TensorOptions(at::kInt));
-    CheckBidirectionalConversion(a, at::ScalarType::Long);
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Long));
   }
   {
     at::Tensor a = at::randint(0, 1, {2, 2}, at::TensorOptions(at::kByte));
-    CheckBidirectionalConversion(a, at::ScalarType::Byte,
-                                 xla::PrimitiveType::PRED);
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Byte,
+                                             xla::PrimitiveType::PRED));
   }
   {
     at::Tensor a = at::rand({2, 2}, at::TensorOptions(at::kFloat));
-    CheckBidirectionalConversion(a, at::ScalarType::Double);
+    EXPECT_TRUE(CheckBidirectionalConversion(a, at::ScalarType::Double));
   }
 }
 
@@ -77,8 +77,8 @@ TEST_F(TensorTest, TestAdd) {
   auto c = a.add(b, 1.0);
 
   ForEachDevice([&](const Device& device) {
-    auto dev_a = XLATensor::Create(a, device, /*requires_grad=*/false);
-    auto dev_b = XLATensor::Create(b, device, /*requires_grad=*/false);
+    auto dev_a = XLATensor::Create(a, device);
+    auto dev_b = XLATensor::Create(b, device);
     auto dev_c = XLATensor::add(dev_a, dev_b, 1.0);
 
     AllClose(c, dev_c);
@@ -95,8 +95,8 @@ TEST_F(TensorTest, TestIntegerAdd) {
       at::Tensor b = at::randint(0, 63, {2, 2}, at::TensorOptions(type));
       auto c = a.add(b, 1.0);
 
-      auto dev_a = XLATensor::Create(a, device, /*requires_grad=*/false);
-      auto dev_b = XLATensor::Create(b, device, /*requires_grad=*/false);
+      auto dev_a = XLATensor::Create(a, device);
+      auto dev_b = XLATensor::Create(b, device);
       auto dev_c = XLATensor::add(dev_a, dev_b, 1.0);
 
       EXPECT_TRUE(EqualValues(c, ToTensor(dev_c)));
@@ -108,7 +108,7 @@ TEST_F(TensorTest, TestSize) {
   at::Tensor input = at::rand({2, 1, 4, 6}, at::TensorOptions(at::kFloat));
   int rank = input.dim();
   ForEachDevice([&](const Device& device) {
-    auto dev_input = XLATensor::Create(input, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(input, device);
     for (int dim = -rank; dim < rank; ++dim) {
       EXPECT_EQ(input.size(dim), dev_input.size(dim));
     }
@@ -119,7 +119,7 @@ TEST_F(TensorTest, TestRelu) {
   at::Tensor input = at::rand({2, 1, 4, 6}, at::TensorOptions(at::kFloat));
   auto output = input.relu();
   ForEachDevice([&](const Device& device) {
-    auto dev_input = XLATensor::Create(input, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(input, device);
     auto dev_output = XLATensor::relu(dev_input);
     AllClose(output, dev_output);
   });
@@ -131,7 +131,7 @@ TEST_F(TensorTest, TestThreshold) {
   float value = 20;
   auto output = at::threshold(input, threshold, value);
   ForEachDevice([&](const Device& device) {
-    auto dev_input = XLATensor::Create(input, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(input, device);
     auto dev_output = XLATensor::threshold(dev_input, threshold, value);
     AllClose(output, dev_output);
   });
@@ -148,10 +148,9 @@ TEST_F(TensorTest, TestAddMatMul) {
   at::Tensor bias = at::rand({labels}, at::TensorOptions(at::kFloat));
   auto output = at::addmm(bias, input, weight);
   ForEachDevice([&](const Device& device) {
-    auto dev_input = XLATensor::Create(input, device, /*requires_grad=*/false);
-    auto dev_weight =
-        XLATensor::Create(weight, device, /*requires_grad=*/false);
-    auto dev_bias = XLATensor::Create(bias, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(input, device);
+    auto dev_weight = XLATensor::Create(weight, device);
+    auto dev_bias = XLATensor::Create(bias, device);
     auto dev_output = XLATensor::addmm(dev_input, dev_weight, dev_bias);
     AllClose(output, dev_output);
   });
@@ -159,10 +158,10 @@ TEST_F(TensorTest, TestAddMatMul) {
 
 TEST_F(TensorTest, TestTranspose) {
   at::Tensor input = at::rand({2, 3}, at::TensorOptions(at::kFloat));
-  auto output = input.t();
+  auto output = at::transpose(input, 0, 1);
   ForEachDevice([&](const Device& device) {
-    auto dev_input = XLATensor::Create(input, device, /*requires_grad=*/false);
-    auto dev_output = XLATensor::t(dev_input);
+    auto dev_input = XLATensor::Create(input, device);
+    auto dev_output = XLATensor::transpose(dev_input, 0, 1);
     AllClose(output, dev_output);
   });
 }
@@ -171,7 +170,7 @@ TEST_F(TensorTest, TestView) {
   at::Tensor input = at::rand({32, 20, 4, 4}, at::TensorOptions(at::kFloat));
   auto output = input.view({-1, 320});
   ForEachDevice([&](const Device& device) {
-    auto dev_input = XLATensor::Create(input, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(input, device);
     auto dev_output = XLATensor::view(dev_input, {-1, 320});
     AllClose(output, dev_output);
   });
@@ -186,8 +185,8 @@ TEST_F(TensorTest, TestViewMod) {
   ForEachDevice([&](const Device& device) {
     at::Tensor xinput =
         at::zeros({32, 20, 4, 4}, at::TensorOptions(at::kFloat));
-    auto dev_input = XLATensor::Create(xinput, device, /*requires_grad=*/false);
-    auto dev_one = XLATensor::Create(one, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(xinput, device);
+    auto dev_one = XLATensor::Create(one, device);
     auto dev_output = XLATensor::view(dev_input, {-1, 320});
     XLATensor::add_(dev_output, dev_one, 1.0);
     XLATensor::add_(dev_input, dev_one, 1.0);
@@ -206,8 +205,8 @@ TEST_F(TensorTest, TestViewModComplex) {
   ForEachDevice([&](const Device& device) {
     at::Tensor xinput =
         at::zeros({32, 20, 4, 4}, at::TensorOptions(at::kFloat));
-    auto dev_input = XLATensor::Create(xinput, device, /*requires_grad=*/false);
-    auto dev_one = XLATensor::Create(one, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(xinput, device);
+    auto dev_one = XLATensor::Create(one, device);
     auto dev_output1 = XLATensor::view(dev_input, {-1, 320});
     XLATensor::add_(dev_output1, dev_one, 1.0);
     auto dev_output2 = XLATensor::view(dev_input, {-1, 160});
@@ -227,8 +226,8 @@ TEST_F(TensorTest, TestViewOfViewMod) {
   ForEachDevice([&](const Device& device) {
     at::Tensor xinput =
         at::zeros({32, 20, 4, 4}, at::TensorOptions(at::kFloat));
-    auto dev_input = XLATensor::Create(xinput, device, /*requires_grad=*/false);
-    auto dev_one = XLATensor::Create(one, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(xinput, device);
+    auto dev_one = XLATensor::Create(one, device);
     auto dev_output1 = XLATensor::view(dev_input, {-1, 320});
     XLATensor::add_(dev_output1, dev_one, 1.0);
     auto dev_output2 = XLATensor::view(dev_output1, {-1, 160});
@@ -241,7 +240,7 @@ TEST_F(TensorTest, TestViewOfViewMod) {
 TEST_F(TensorTest, TestLogSoftmax) {
   at::Tensor input = at::rand({5, 3, 4, 2}, at::TensorOptions(at::kFloat));
   ForEachDevice([&](const Device& device) {
-    auto dev_input = XLATensor::Create(input, device, /*requires_grad=*/false);
+    auto dev_input = XLATensor::Create(input, device);
     for (int dim = 0; dim < input.dim(); ++dim) {
       auto output = input.log_softmax(dim);
       auto dev_output = XLATensor::log_softmax(dev_input, dim);
@@ -261,13 +260,13 @@ TEST_F(TensorTest, TestMaxPool2D) {
                          /*padding=*/{padding, padding}, /*dilation=*/{1, 1},
                          /*ceil_mode=*/false);
       ForEachDevice([&](const Device& device) {
-        auto dev_input =
-            XLATensor::Create(input, device, /*requires_grad=*/false);
-        auto dev_output =
-            XLATensor::max_pool2d(dev_input,
-                                  /*kernel_size=*/{kernel_size, kernel_size},
-                                  /*stride=*/{stride, stride},
-                                  /*padding=*/{padding, padding});
+        auto dev_input = XLATensor::Create(input, device);
+        auto dev_output = XLATensor::max_pool_nd(
+            dev_input,
+            /*spatial_dim_count=*/2,
+            /*kernel_size=*/{kernel_size, kernel_size},
+            /*stride=*/{stride, stride},
+            /*padding=*/{padding, padding}, /*ceil_mode=*/false);
         AllClose(output, dev_output);
       });
     }
@@ -285,13 +284,14 @@ TEST_F(TensorTest, TestMaxPool2DNonSquare) {
           /*padding=*/{padding, padding + 1}, /*dilation=*/{1, 1},
           /*ceil_mode=*/false);
       ForEachDevice([&](const Device& device) {
-        auto dev_input =
-            XLATensor::Create(input, device, /*requires_grad=*/false);
-        auto dev_output = XLATensor::max_pool2d(
+        auto dev_input = XLATensor::Create(input, device);
+        auto dev_output = XLATensor::max_pool_nd(
             dev_input,
+            /*spatial_dim_count=*/2,
             /*kernel_size=*/{kernel_size, kernel_size + 1},
             /*stride=*/{stride, stride + 1},
-            /*padding=*/{padding, padding + 1});
+            /*padding=*/{padding, padding + 1},
+            /*ceil_mode=*/false);
         AllClose(output, dev_output);
       });
     }
@@ -304,19 +304,20 @@ TEST_F(TensorTest, TestAvgPool2D) {
   for (int stride = 1; stride <= 2; ++stride) {
     for (int padding = 0; padding <= 1; ++padding) {
       for (bool count_include_pad : {true, false}) {
-        auto output =
-            at::avg_pool2d(input, /*kernel_size=*/{kernel_size, kernel_size},
-                           /*stride=*/{stride, stride},
-                           /*padding=*/{padding, padding}, /*ceil_mode=*/false,
-                           count_include_pad);
+        auto output = at::avg_pool2d(input,
+                                     /*kernel_size=*/{kernel_size, kernel_size},
+                                     /*stride=*/{stride, stride},
+                                     /*padding=*/{padding, padding},
+                                     /*ceil_mode=*/false, count_include_pad);
         ForEachDevice([&](const Device& device) {
-          auto dev_input =
-              XLATensor::Create(input, device, /*requires_grad=*/false);
-          auto dev_output = XLATensor::avg_pool2d(
-              dev_input,
-              /*kernel_size=*/{kernel_size, kernel_size},
-              /*stride=*/{stride, stride},
-              /*padding=*/{padding, padding}, count_include_pad);
+          auto dev_input = XLATensor::Create(input, device);
+          auto dev_output =
+              XLATensor::avg_pool_nd(dev_input,
+                                     /*spatial_dim_count=*/2,
+                                     /*kernel_size=*/{kernel_size, kernel_size},
+                                     /*stride=*/{stride, stride},
+                                     /*padding=*/{padding, padding},
+                                     /*ceil_mode=*/false, count_include_pad);
           AllClose(output, dev_output);
         });
       }
@@ -331,18 +332,20 @@ TEST_F(TensorTest, TestAvgPool2DNonSquare) {
     for (int padding = 0; padding <= 1; ++padding) {
       for (bool count_include_pad : {true, false}) {
         auto output = at::avg_pool2d(
-            input, /*kernel_size=*/{kernel_size, kernel_size + 1},
+            input,
+            /*kernel_size=*/{kernel_size, kernel_size + 1},
             /*stride=*/{stride, stride + 1},
             /*padding=*/{padding, padding + 1}, /*ceil_mode=*/false,
             /*count_include_pad=*/count_include_pad);
         ForEachDevice([&](const Device& device) {
-          auto dev_input =
-              XLATensor::Create(input, device, /*requires_grad=*/false);
-          auto dev_output = XLATensor::avg_pool2d(
+          auto dev_input = XLATensor::Create(input, device);
+          auto dev_output = XLATensor::avg_pool_nd(
               dev_input,
+              /*spatial_dim_count=*/2,
               /*kernel_size=*/{kernel_size, kernel_size + 1},
               /*stride=*/{stride, stride + 1},
               /*padding=*/{padding, padding + 1},
+              /*ceil_mode=*/false,
               /*count_include_pad=*/count_include_pad);
           AllClose(output, dev_output);
         });
@@ -370,14 +373,11 @@ TEST_F(TensorTest, TestConv2D) {
                                /*stride=*/{stride, stride},
                                /*padding=*/{padding, padding});
         ForEachDevice([&](const Device& device) {
-          auto dev_input =
-              XLATensor::Create(input, device, /*requires_grad=*/false);
-          auto dev_weight =
-              XLATensor::Create(weight, device, /*requires_grad=*/false);
+          auto dev_input = XLATensor::Create(input, device);
+          auto dev_weight = XLATensor::Create(weight, device);
           XLATensor dev_output;
           if (with_bias) {
-            auto dev_bias =
-                XLATensor::Create(bias, device, /*requires_grad=*/false);
+            auto dev_bias = XLATensor::Create(bias, device);
             dev_output = XLATensor::conv2d(dev_input, dev_weight, dev_bias,
                                            /*stride=*/{stride, stride},
                                            /*padding=*/{padding, padding});
@@ -412,14 +412,11 @@ TEST_F(TensorTest, TestConv2DNonSquare) {
                                /*stride=*/{stride, stride + 1},
                                /*padding=*/{padding, padding + 1});
         ForEachDevice([&](const Device& device) {
-          auto dev_input =
-              XLATensor::Create(input, device, /*requires_grad=*/false);
-          auto dev_weight =
-              XLATensor::Create(weight, device, /*requires_grad=*/false);
+          auto dev_input = XLATensor::Create(input, device);
+          auto dev_weight = XLATensor::Create(weight, device);
           XLATensor dev_output;
           if (with_bias) {
-            auto dev_bias =
-                XLATensor::Create(bias, device, /*requires_grad=*/false);
+            auto dev_bias = XLATensor::Create(bias, device);
             dev_output = XLATensor::conv2d(dev_input, dev_weight, dev_bias,
                                            /*stride=*/{stride, stride + 1},
                                            /*padding=*/{padding, padding + 1});

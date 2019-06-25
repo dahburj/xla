@@ -1,4 +1,5 @@
 #include "torch_xla/csrc/ops/log_softmax_backward.h"
+
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "torch_xla/csrc/lowering_context.h"
@@ -8,30 +9,17 @@
 namespace torch_xla {
 namespace ir {
 namespace ops {
-namespace {
-
-xla::Shape NodeOutputShape(const Value& grad_output, const Value& output,
-                           xla::int64 dim) {
-  auto lower_for_shape_fn =
-      [dim](tensorflow::gtl::ArraySlice<const xla::XlaOp> operands)
-      -> xla::XlaOp {
-    XLA_CHECK_EQ(operands.size(), 2)
-        << "Unexpected number of operands: " << operands.size();
-    return BuildLogSoftmaxGrad(/*grad_output=*/operands[0],
-                               /*output=*/operands[1], dim);
-  };
-  return InferOutputShape({grad_output.shape(), output.shape()},
-                          lower_for_shape_fn);
-}
-
-}  // namespace
 
 LogSoftmaxBackward::LogSoftmaxBackward(const Value& grad_output,
                                        const Value& output, xla::int64 dim)
     : Node(ir::OpKind(at::aten::_log_softmax_backward_data),
-           {grad_output, output}, NodeOutputShape(grad_output, output, dim),
+           {grad_output, output}, grad_output.shape(),
            /*num_outputs=*/1, xla::util::MHash(dim)),
       dim_(dim) {}
+
+NodePtr LogSoftmaxBackward::Clone(OpList operands) const {
+  return MakeNode<LogSoftmaxBackward>(operands.at(0), operands.at(1), dim_);
+}
 
 XlaOpVector LogSoftmaxBackward::Lower(LoweringContext* loctx) const {
   xla::XlaOp grad_output = loctx->GetOutputOp(operand(0));

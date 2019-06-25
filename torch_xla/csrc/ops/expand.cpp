@@ -23,9 +23,15 @@ xla::Shape NodeOutputShape(const Value& input,
 }  // namespace
 
 Expand::Expand(const Value& input, std::vector<xla::int64> size)
-    : Node(ir::OpKind(at::aten::expand), {input}, NodeOutputShape(input, size),
-           /*num_outputs=*/1, xla::util::MHash(size)),
+    : Node(
+          ir::OpKind(at::aten::expand), {input},
+          [&]() { return NodeOutputShape(input, size); },
+          /*num_outputs=*/1, xla::util::MHash(size)),
       size_(std::move(size)) {}
+
+NodePtr Expand::Clone(OpList operands) const {
+  return MakeNode<Expand>(operands.at(0), size_);
+}
 
 XlaOpVector Expand::Lower(LoweringContext* loctx) const {
   xla::XlaOp input = loctx->GetOutputOp(operand(0));

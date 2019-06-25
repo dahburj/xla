@@ -1,11 +1,11 @@
 #pragma once
 
-#include <vector>
-
 #include <ATen/Device.h>
 #include <ATen/Functions.h>
 #include <ATen/Tensor.h>
 #include <ATen/Type.h>
+
+#include <vector>
 
 #include "tensorflow/core/lib/gtl/array_slice.h"
 #include "torch_xla/csrc/device.h"
@@ -13,6 +13,8 @@
 
 namespace torch_xla {
 namespace bridge {
+
+c10::optional<XLATensor> TryGetXlaTensor(const at::Tensor& tensor);
 
 // Extracts the XLATensor out of our version of at::Tensor. Throws an exception
 // if tensor is not an XLA tensor.
@@ -37,10 +39,6 @@ XLATensor GetOrCreateXlaTensor(const at::Tensor& tensor, const Device& device);
 std::vector<at::Tensor> XlaCreateTensorList(const at::TensorList& tensors,
                                             const std::vector<bool>* writeable);
 
-// Creates an at::Tensor out of an XLA tensor, but making the XLA tensor to
-// discard any device side data. Throws if tensor is not an XLA tensor.
-at::Tensor XlaToAtenMutableTensor(const at::Tensor& tensor);
-
 // Tries to extract the device out of the XLA tensor. Returns nullopt if the
 // input is not an XLA tensor.
 c10::optional<Device> GetXlaDevice(const at::Tensor& tensor);
@@ -52,6 +50,15 @@ c10::optional<Device> GetXlaDevice(const at::TensorOptions& tensor_options);
 c10::optional<Device> GetXlaDevice(const c10::Device& device);
 
 Device AtenDeviceToXlaDevice(const c10::Device& device);
+
+c10::Device XlaDeviceToAtenDevice(const Device& device);
+
+std::string ToXlaString(const c10::Device& device);
+
+c10::Device AtenDefaultDevice();
+
+at::Tensor XlaToAtenTensor(XLATensor xla_tensor,
+                           const at::TensorOptions& tensor_options);
 
 // Creates an ATen tensor with XLA type id from an XLATensor.
 at::Tensor AtenFromXlaTensor(XLATensor xla_tensor);

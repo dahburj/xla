@@ -1,9 +1,10 @@
 #pragma once
 
+#include <c10/core/Scalar.h>
+#include <c10/util/Optional.h>
+
 #include <functional>
 #include <vector>
-
-#include <c10/core/Scalar.h>
 
 #include "tensorflow/compiler/xla/client/xla_builder.h"
 #include "tensorflow/compiler/xla/literal_util.h"
@@ -12,7 +13,6 @@
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "tensorflow/core/lib/bfloat16/bfloat16.h"
 #include "tensorflow/core/lib/gtl/array_slice.h"
-#include "torch/csrc/jit/ir.h"
 
 namespace torch_xla {
 
@@ -64,7 +64,7 @@ class XlaHelpers {
     return xla::ConstantLiteral(builder, ScalarLiteral(scalar_value, type));
   }
 
-  static xla::XlaOp ScalarValue(const at::Scalar& scalar_value,
+  static xla::XlaOp ScalarValue(at::Scalar scalar_value,
                                 xla::PrimitiveType type,
                                 xla::XlaBuilder* builder) {
     if (scalar_value.isFloatingPoint()) {
@@ -89,11 +89,19 @@ class XlaHelpers {
 
   // Creates a scalar broadcasted to a given shape.
   template <class T>
+  static xla::XlaOp ScalarBroadcast(
+      T scalar_value, xla::PrimitiveType type,
+      tensorflow::gtl::ArraySlice<const xla::int64> dimensions,
+      xla::XlaBuilder* builder) {
+    xla::XlaOp scalar_op = ScalarValue<T>(scalar_value, type, builder);
+    return xla::Broadcast(scalar_op, dimensions);
+  }
+
+  template <class T>
   static xla::XlaOp ScalarBroadcast(T scalar_value, const xla::Shape& shape,
                                     xla::XlaBuilder* builder) {
-    xla::XlaOp scalar_op =
-        ScalarValue<T>(scalar_value, shape.element_type(), builder);
-    return xla::Broadcast(scalar_op, shape.dimensions());
+    return ScalarBroadcast<T>(scalar_value, shape.element_type(),
+                              shape.dimensions(), builder);
   }
 
   // Creates a convolution or dot precision configuration.
@@ -106,9 +114,9 @@ class XlaHelpers {
     return xla::util::ToVector<xla::int64>(input);
   }
 
-  // Creates an XLA padding configuration from a padding attribute value.
-  static xla::PaddingConfig MakeXlaPaddingConfig(
-      tensorflow::gtl::ArraySlice<const xla::int64> padding);
+  static c10::optional<xla::int64> I64Optional(c10::optional<int64_t> opt) {
+    return opt ? c10::optional<xla::int64>(*opt) : c10::nullopt;
+  }
 
   // Creates an XLA padding configuration from a n-dimensional padding list.
   static xla::PaddingConfig MakeXlaPaddingConfigFromNdPadding(
@@ -122,6 +130,11 @@ class XlaHelpers {
   // Get the canonical dimension index in the [0, rank) interval. Negative
   // indices are interpreted as follows: -1 is rank-1, -2 is rank-2 etc.
   static xla::int64 GetCanonicalDimensionIndex(xla::int64 dim, xla::int64 rank);
+
+  // Same as above, for multiple dimensions.
+  static std::vector<xla::int64> GetCanonicalDimensionIndices(
+      tensorflow::gtl::ArraySlice<const xla::int64> dimensions,
+      xla::int64 rank);
 
   // Returns the canonical position in the dim dimension, handling negative
   // values for the position.
@@ -139,6 +152,38 @@ class XlaHelpers {
   static xla::XlaComputation CreateMulComputation(xla::PrimitiveType type);
 
   static xla::XlaComputation CreateMaxComputation(xla::PrimitiveType type);
+
+  static xla::XlaComputation CreateMinComputation(xla::PrimitiveType type);
+
+  // Returns an XLA operation which is a reshape to the expected rank, by
+  // appending 1s to the major dimension. If offset is greater than zero, 1s
+  // will be prepened to the minor dimension as well.
+  // Expected condition: rank(input) + offset <= expected_rank
+  static xla::XlaOp ReshapeToRank(const xla::XlaOp& input,
+                                  xla::int64 expected_rank,
+                                  xla::int64 offset = 0);
+
+  // Gathers the input using the order specified by the permutation. For each i,
+  // output[i] = input[permutation[i]]. The given permutation must be the same
+  // size as the input.
+  template <typename Container>
+  static std::vector<typename Container::value_type> Permute(
+      tensorflow::gtl::ArraySlice<const xla::int64> permutation,
+      const Container& input) {
+    using T = typename Container::value_type;
+    XLA_CHECK(xla::IsPermutation(permutation, input.size()))
+        << "Invalid permutation specified";
+    std::vector<T> output(input.size());
+    for (size_t i = 0; i < permutation.size(); ++i) {
+      output[i] = input[permutation[i]];
+    }
+    return output;
+  }
+
+  // Creates a transposition from the given input and dimensions.
+  static std::vector<xla::int64> MakeTransposePermutation(xla::int64 dim0,
+                                                          xla::int64 dim1,
+                                                          xla::int64 rank);
 
   // Performs type promotion to make sure both operations return the same type.
   static std::pair<xla::XlaOp, xla::XlaOp> PromoteValues(const xla::XlaOp& op1,

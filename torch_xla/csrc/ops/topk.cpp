@@ -25,13 +25,18 @@ xla::Shape NodeOutputShape(const Value& input, xla::int64 k, xla::int64 dim,
 
 TopK::TopK(const Value& input, xla::int64 k, xla::int64 dim, bool largest,
            bool sorted)
-    : Node(ir::OpKind(at::aten::topk), {input},
-           NodeOutputShape(input, k, dim, largest, sorted),
-           /*num_outputs=*/2, xla::util::MHash(k, dim, largest, sorted)),
+    : Node(
+          ir::OpKind(at::aten::topk), {input},
+          [&]() { return NodeOutputShape(input, k, dim, largest, sorted); },
+          /*num_outputs=*/2, xla::util::MHash(k, dim, largest, sorted)),
       k_(k),
       dim_(dim),
       largest_(largest),
       sorted_(sorted) {}
+
+NodePtr TopK::Clone(OpList operands) const {
+  return MakeNode<TopK>(operands.at(0), k_, dim_, largest_, sorted_);
+}
 
 XlaOpVector TopK::Lower(LoweringContext* loctx) const {
   xla::XlaOp input = loctx->GetOutputOp(operand(0));

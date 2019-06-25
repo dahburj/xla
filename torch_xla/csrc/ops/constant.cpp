@@ -10,7 +10,8 @@ namespace ir {
 namespace ops {
 
 Constant::Constant(xla::Literal value)
-    : Node(OpKind(at::prim::Constant), value.shape(), value.Hash()),
+    : Node(OpKind(at::prim::Constant), value.shape(), /*num_outputs=*/1,
+           value.Hash()),
       value_(std::move(value)) {}
 
 std::string Constant::ToString() const {
@@ -21,6 +22,10 @@ std::string Constant::ToString() const {
   std::stringstream ss;
   ss << Node::ToString() << ", value=" << value_as_string;
   return ss.str();
+}
+
+NodePtr Constant::Clone(OpList operands) const {
+  return MakeNode<Constant>(value_.Clone());
 }
 
 XlaOpVector Constant::Lower(LoweringContext* loctx) const {

@@ -5,36 +5,23 @@
 #include "torch_xla/csrc/tensor_util.h"
 
 namespace torch_xla {
+namespace {
 
-xla::XlaOp BuildArithmeticOp(const torch::jit::Node* node,
-                             const xla::XlaOp& lhs, const xla::XlaOp& rhs) {
-  switch (node->kind()) {
-    case at::aten::add: {
-      return XlaHelpers::PromotedAdd(lhs, rhs);
-    }
-    case at::aten::mul: {
-      return XlaHelpers::PromotedMul(lhs, rhs);
-    }
-    case at::aten::sub: {
-      return XlaHelpers::PromotedSub(lhs, rhs);
-    }
-    case at::aten::div: {
-      return XlaHelpers::PromotedDiv(lhs, rhs);
-    }
-    default:
-      XLA_ERROR() << "Invalid binary operator kind: " << node->kind();
-  }
+xla::XlaOp Between(const xla::XlaOp& input, at::Scalar min_val,
+                   at::Scalar max_val) {
+  xla::Shape shape = XlaHelpers::ShapeOfXlaOp(input);
+  xla::PrimitiveType element_type = shape.element_type();
+  xla::XlaBuilder* builder = input.builder();
+  xla::XlaOp check_low = BuildComparisonOp(
+      at::aten::ge, input,
+      XlaHelpers::ScalarValue(min_val, element_type, builder));
+  xla::XlaOp check_high = BuildComparisonOp(
+      at::aten::le, input,
+      XlaHelpers::ScalarValue(max_val, element_type, builder));
+  return xla::And(check_low, check_high);
 }
 
-xla::XlaOp BuildComparisonOp(const torch::jit::Node* node,
-                             const xla::XlaOp& operand) {
-  xla::XlaBuilder* builder = operand.builder();
-  xla::Shape operand_shape = XlaHelpers::ShapeOfXlaOp(operand);
-  xla::XlaOp xla_other = XlaHelpers::ScalarValue(
-      node->get<at::Scalar>(at::attr::other).value().to<float>(),
-      operand_shape.element_type(), builder);
-  return BuildComparisonOp(node->kind(), operand, xla_other);
-}
+}  // namespace
 
 xla::XlaOp BuildComparisonOp(c10::Symbol kind, const xla::XlaOp& input,
                              const xla::XlaOp& other) {
@@ -76,26 +63,58 @@ xla::XlaOp BuildRelu(const xla::XlaOp& input) {
                              0, input_shape.element_type(), input.builder()));
 }
 
+xla::XlaOp BuildHardshrink(const xla::XlaOp& input, at::Scalar lambda) {
+  xla::Shape shape = XlaHelpers::ShapeOfXlaOp(input);
+  return xla::Select(Between(input, -lambda, lambda),
+                     XlaHelpers::ScalarBroadcast(0, shape, input.builder()),
+                     input);
+}
+
+xla::XlaOp BuildSoftshrink(const xla::XlaOp& input, at::Scalar lambda) {
+  xla::XlaBuilder* builder = input.builder();
+  xla::Shape shape = XlaHelpers::ShapeOfXlaOp(input);
+  xla::XlaOp zero = XlaHelpers::ScalarBroadcast(0, shape, builder);
+  xla::XlaOp xla_lambd =
+      XlaHelpers::ScalarBroadcast(lambda.to<double>(), shape, builder);
+  xla::XlaOp le_lambda_branch =
+      xla::Select(xla::Lt(input, Neg(xla_lambd)), input + xla_lambd, zero);
+  return xla::Select(xla::Le(input, xla_lambd), le_lambda_branch,
+                     input - xla_lambd);
+}
+
+xla::XlaOp BuildShrinkBackward(const xla::XlaOp& grad_output,
+                               const xla::XlaOp& input, at::Scalar lambda) {
+  xla::Shape shape = XlaHelpers::ShapeOfXlaOp(input);
+  return xla::Select(Between(input, -lambda, lambda),
+                     XlaHelpers::ScalarBroadcast(0, shape, input.builder()),
+                     grad_output);
+}
+
+xla::XlaOp BuildHardtanhBackward(const xla::XlaOp& grad_output,
+                                 const xla::XlaOp& input, at::Scalar min_val,
+                                 at::Scalar max_val) {
+  xla::Shape shape = XlaHelpers::ShapeOfXlaOp(grad_output);
+  xla::XlaOp zero = xla::Broadcast(
+      XlaHelpers::ScalarValue(0, shape.element_type(), grad_output.builder()),
+      shape.dimensions());
+  return xla::Select(Between(input, min_val, max_val), grad_output, zero);
+}
+
 xla::XlaOp BuildLeakyRelu(const xla::XlaOp& input,
                           double negative_slope_value) {
+  return BuildLeakyReluBackward(input, input, negative_slope_value);
+}
+
+xla::XlaOp BuildLeakyReluBackward(const xla::XlaOp& grad_output,
+                                  const xla::XlaOp& input,
+                                  double negative_slope_value) {
   xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(input);
   xla::XlaOp zero = XlaHelpers::ScalarValue<double>(
       0, input_shape.element_type(), input.builder());
   xla::XlaOp negative_slope = XlaHelpers::ScalarValue(
       negative_slope_value, input_shape.element_type(), input.builder());
-  return xla::Select(xla::Ge(input, zero), input, negative_slope * input);
-}
-
-xla::XlaOp BuildTypeAs(const torch::jit::Node* node,
-                       const xla::XlaOp& operand) {
-  const auto node_outputs = node->outputs();
-  XLA_CHECK_EQ(node_outputs.size(), 1);
-  const auto output_tensor_type =
-      node_outputs[0]->type()->cast<at::DimensionedTensorType>();
-  XLA_CHECK(output_tensor_type);
-  xla::PrimitiveType target_type = MakeXlaPrimitiveType(
-      output_tensor_type->scalarType(), /*device=*/nullptr);
-  return xla::ConvertElementType(operand, target_type);
+  return xla::Select(xla::Gt(input, zero), grad_output,
+                     negative_slope * grad_output);
 }
 
 xla::XlaOp BuildSigmoid(const xla::XlaOp& input) {

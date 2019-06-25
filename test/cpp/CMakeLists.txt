@@ -23,7 +23,6 @@ ExternalProject_Add(
   GIT_TAG master
   SOURCE_DIR "${GTEST_DIR}/src/googletest-src"
   BINARY_DIR "${GTEST_DIR}/src/googletest-build"
-  CMAKE_ARGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
   # Disable install step
   INSTALL_COMMAND ""
   LOG_DOWNLOAD ON
@@ -51,10 +50,14 @@ include_directories(
 set(TORCH_XLA_TEST_SOURCES
   main.cpp
   cpp_test_util.cpp
+  test_async_task.cpp
   test_aten_xla_tensor.cpp
   test_ir.cpp
   test_mayberef.cpp
+  test_op_by_op_executor.cpp
+  test_replication.cpp
   test_tensor.cpp
+  test_xla_util_cache.cpp
   torch_xla_test.cpp
 )
 
@@ -98,7 +101,11 @@ find_library(PTPY_LIB "libtorch_python.so"
   HINTS "${PT_DIR}/build/lib")
 find_library(C10_LIB "libc10.so"
   HINTS "${PT_DIR}/build/lib")
-find_library(CAFFE_LIB "libcaffe2.so"
+find_library(CAFFE_LIB_DET "libcaffe2_detectron_ops.so"
+  HINTS "${PT_DIR}/build/lib")
+find_library(CAFFE_LIB_TDYN "libcaffe2_module_test_dynamic.so"
+  HINTS "${PT_DIR}/build/lib")
+find_library(CAFFE_LIB_OBS "libcaffe2_observers.so"
   HINTS "${PT_DIR}/build/lib")
 
 # Use --unresolved-symbols=ignore-all to get around the c10::Half::from_bits
@@ -110,7 +117,9 @@ target_link_libraries(
   "${PTXLA_LIBDIR}/torch_xla/lib/libxla_computation_client.so"
   "${PTPY_LIB}"
   "${PT_LIB}"
-  "${CAFFE_LIB}"
+  "${CAFFE_LIB_DET}"
+  "${CAFFE_LIB_TDYN}"
+  "${CAFFE_LIB_OBS}"
   "${C10_LIB}"
   "${BINARY_DIR}/lib/${CMAKE_FIND_LIBRARY_PREFIXES}gtest.a"
   "${PYTHON_LIBRARY}"

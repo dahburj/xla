@@ -9,6 +9,7 @@
 #include "tensorflow/compiler/xla/client/xla_builder.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/xla_client/computation_client.h"
+#include "tensorflow/core/lib/gtl/array_slice.h"
 #include "tensorflow/core/platform/macros.h"
 #include "torch_xla/csrc/ir.h"
 #include "torch_xla/csrc/ir_util.h"
@@ -18,7 +19,7 @@ namespace ir {
 
 class LoweringContext {
  public:
-  LoweringContext(const std::string& name) : builder_(name) {}
+  explicit LoweringContext(const std::string& name) : builder_(name) {}
 
   xla::XlaBuilder* builder() { return &builder_; }
 
@@ -30,7 +31,10 @@ class LoweringContext {
 
   // Retrieves the vector holding all the tensors associated with the parameter
   // instructions which have been created.
-  std::vector<xla::ComputationClient::Data*> GetParametersData() const;
+  const std::vector<xla::ComputationClient::DataPtr>& GetParametersData()
+      const {
+    return parameters_;
+  }
 
   // Adds the output of a given operation to the result tuple.
   xla::int64 AddResult(xla::XlaOp op);
@@ -55,13 +59,17 @@ class LoweringContext {
   // API after having called the AddResult() API.
   xla::StatusOr<xla::XlaComputation> Build(const xla::XlaOp& root);
 
+  // Lowers a single IR node. All the inputs to the node must have a lowering
+  // before calling this API. Returns the generated XLA operations.
+  XlaOpVector LowerNode(const Node* node);
+
  private:
   // Reports an XLA builder error for the given node.
   TF_ATTRIBUTE_NORETURN void ReportBuilderError(const Node* node,
                                                 const char* error_msg);
 
   xla::XlaBuilder builder_;
-  std::vector<std::shared_ptr<xla::ComputationClient::Data>> parameters_;
+  std::vector<xla::ComputationClient::DataPtr> parameters_;
   std::unordered_map<xla::ComputationClient::Data*, xla::XlaOp> parameters_map_;
   std::vector<xla::XlaOp> root_tuple_;
   OutputMap<xla::XlaOp> emitted_outputs_;

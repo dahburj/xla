@@ -3,14 +3,40 @@
 #include <functional>
 #include <sstream>
 
+#include "tensorflow/compiler/xla/xla_client/cache.h"
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/sys_util.h"
 #include "tensorflow/compiler/xla/xla_client/util.h"
 #include "torch_xla/csrc/lowering_context.h"
-#include "torch_xla/csrc/python_util.h"
 
 namespace torch_xla {
 namespace ir {
+namespace {
+
+using ShapeCache = xla::util::Cache<size_t, xla::Shape>;
+
+ShapeCache* GetShapeCache() {
+  static const size_t kMaxShapeCacheSize = 1024;
+  static ShapeCache* cache = new ShapeCache(kMaxShapeCacheSize);
+  return cache;
+}
+
+void EmitShortFrameInfo(std::ostream& stream,
+                        const std::vector<SourceLocation>& frames) {
+  if (!frames.empty()) {
+    const SourceLocation& frame = frames.front();
+    std::string::size_type pos = frame.file.find_last_of('/');
+    if (pos == std::string::npos) {
+      pos = 0;
+    } else {
+      ++pos;
+    }
+    stream << ", location=" << frame.function << "@" << frame.file.substr(pos)
+           << ":" << frame.line;
+  }
+}
+
+}  // namespace
 
 bool Use::operator<(const Use& rhs) const {
   if (node->op() != rhs.node->op()) {
@@ -38,6 +64,10 @@ const xla::Shape& Output::shape() const { return node->shape(index); }
 
 const xla::Shape& Output::node_shape() const { return node->shape(); }
 
+size_t Output::hash() const {
+  return xla::util::HashCombine(node->hash(), index);
+}
+
 std::string Output::ToString() const {
   std::stringstream ss;
   ss << node->ToString() << ", index=" << index;
@@ -48,28 +78,45 @@ const xla::Shape& Value::shape() const { return node->shape(index); }
 
 const xla::Shape& Value::node_shape() const { return node->shape(); }
 
+size_t Value::hash() const {
+  return xla::util::HashCombine(node->hash(), index);
+}
+
 OpKind OpKind::Get(const std::string& name) {
   return OpKind(c10::Symbol::fromQualString(name));
 }
+
+size_t OpKind::hash() const { return xla::util::StringHash(op.toQualString()); }
 
 Node::Node(OpKind op, OpList operands, xla::Shape shape, size_t num_outputs,
            size_t hash_seed)
     : op_(std::move(op)),
       num_outputs_(num_outputs),
       shape_(std::move(shape)),
-      hash_(xla::util::HashCombine(op_.hash(), hash_seed)) {
+      node_hash_(xla::util::HashCombine(op_.hash(), hash_seed)),
+      hash_(node_hash_) {
   metadata_.frame_info = GetFrameInfo();
   for (auto& operand : operands) {
     AddOperand(operand.node, operand.index);
-    graph_size_ += operand->graph_size();
-    hash_ = xla::util::HashCombine(hash_, operand->hash());
+    hash_ = xla::util::HashCombine(hash_, operand.hash());
   }
 }
 
-Node::Node(OpKind op, xla::Shape shape, size_t hash_seed)
+Node::Node(OpKind op, OpList operands,
+           const std::function<xla::Shape()>& shape_fn, size_t num_outputs,
+           size_t hash_seed)
+    : Node(std::move(op), operands, xla::Shape(), num_outputs, hash_seed) {
+  // Forward the constructor to the one above (with empty shape), so we have the
+  // full hash information, then fetch/compute the real shape.
+  shape_ = GetOpShape(shape_fn);
+}
+
+Node::Node(OpKind op, xla::Shape shape, size_t num_outputs, size_t hash_seed)
     : op_(std::move(op)),
+      num_outputs_(num_outputs),
       shape_(std::move(shape)),
-      hash_(GetOpHash(op_, shape_, hash_seed)) {
+      node_hash_(GetOpHash(op_, shape_, hash_seed)),
+      hash_(node_hash_) {
   metadata_.frame_info = GetFrameInfo();
 }
 
@@ -135,7 +182,12 @@ std::string Node::ToString() const {
   if (num_outputs() > 1) {
     ss << ", num_outputs=" << num_outputs();
   }
+  EmitShortFrameInfo(ss, metadata_.frame_info);
   return ss.str();
+}
+
+NodePtr Node::Clone(OpList operands) const {
+  XLA_ERROR() << "Cloning not implemented for node: " << *this;
 }
 
 XlaOpVector Node::Lower(LoweringContext* loctx) const {
@@ -143,30 +195,26 @@ XlaOpVector Node::Lower(LoweringContext* loctx) const {
 }
 
 size_t Node::GetOpHash(OpKind op, const xla::Shape& shape, size_t hash_seed) {
-  size_t h = xla::util::HashCombine(op.hash(),
-                                    std::hash<std::string>()(shape.ToString()));
+  size_t h =
+      xla::util::HashCombine(op.hash(), xla::util::Hash(shape.ToString()));
   return xla::util::HashCombine(h, hash_seed);
 }
 
-std::string Node::GetFrameInfo() {
+xla::Shape Node::GetOpShape(const std::function<xla::Shape()>& shape_fn) const {
+  ShapeCache* shape_cache = GetShapeCache();
+  auto shape = shape_cache->Get(hash());
+  if (shape == nullptr) {
+    shape = shape_cache->Add(hash(), std::make_shared<xla::Shape>(shape_fn()));
+  }
+  return *shape;
+}
+
+std::vector<SourceLocation> Node::GetFrameInfo() {
   // At the time of writing, retrieving Python frames costs from 1us up to 20us.
   // This per IR Node. Since it is not unreasonable to have a many hundreds of
   // IR Node, this can be a multi-millisecond cost, which is not negligible.
   static bool wants_frames = xla::sys_util::GetEnvBool("XLA_IR_DEBUG", false);
-  if (!wants_frames) {
-    return std::string();
-  }
-  std::vector<SourceLocation> frames = GetPythonFrames();
-  if (frames.empty()) {
-    return std::string();
-  }
-  std::stringstream ss;
-  ss << "Python Frames To IR Node:\n";
-  for (auto& location : frames) {
-    ss << "  " << location.function << " (" << location.file << ":"
-       << location.line << ")\n";
-  }
-  return ss.str();
+  return wants_frames ? GetPythonFrames() : std::vector<SourceLocation>();
 }
 
 }  // namespace ir
